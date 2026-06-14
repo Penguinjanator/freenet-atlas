@@ -42,10 +42,6 @@ fn record_order(r: &SignedRecord) -> (u64, bool, [u8; 64]) {
     (r.body.version(), is_tomb, r.sig.to_bytes())
 }
 
-fn key_auth_order(k: &KeyAuth) -> (u64, [u8; 64]) {
-    (k.body.version, k.sig.to_bytes())
-}
-
 impl IndexState {
     pub fn initialized(key_auth: KeyAuth) -> Self {
         IndexState {
@@ -85,40 +81,23 @@ impl IndexState {
     /// Merge another already-sig-verified state into this one. Commutative,
     /// associative, idempotent.
     ///
-    /// Authorization is applied *against the final (merged) key_auth* and gates
-    /// record selection, not just a post-filter. This is what makes revocation
-    /// safe: when the winning key_auth de-authorizes a key, records signed by
-    /// that key are never even considered, so they can neither resurrect (win on
-    /// version then persist) nor grief (win on version then get filtered,
-    /// erasing the legitimate record). Records by keys the final key_auth still
-    /// authorizes are selected per-subject by `record_order`.
+    /// `key_auth` is immutable in 0.1: set once at init, never rotated, so every
+    /// non-empty state for a contract carries the same root-signed `key_auth`.
+    /// Records therefore merge as a plain per-subject max by `record_order` (a
+    /// clean monoid). Authorization is enforced at the update boundary, not here:
+    /// `apply_delta` only admits records authorized by the immutable `key_auth`,
+    /// and `update_state` re-runs `verify` on the merged result. Making
+    /// `key_auth` mutable here (rotation/revocation) would break associativity,
+    /// because authorization is not monotone (a key can be de- then
+    /// re-authorized), so dropping records against a non-final `key_auth` would
+    /// depend on merge order. Rotation is deferred to a post-0.1 design.
     pub fn merge(&mut self, other: &IndexState) {
-        // 1. Resolve the final key_auth (higher version wins).
-        if let Some(oka) = &other.key_auth {
-            let take = self
-                .key_auth
-                .as_ref()
-                .map_or(true, |cur| key_auth_order(oka) > key_auth_order(cur));
-            if take {
-                self.key_auth = Some(oka.clone());
-            }
+        // Adopt key_auth only to initialize from empty; an existing one is
+        // immutable. With a unique root-signed key_auth this is order-independent.
+        if self.key_auth.is_none() {
+            self.key_auth = other.key_auth.clone();
         }
-        let ka = match self.key_auth.clone() {
-            Some(ka) => ka,
-            None => {
-                // No authority yet: nothing can be authorized.
-                self.records.clear();
-                return;
-            }
-        };
-        // 2. Drop any of our existing records the final key_auth no longer
-        //    authorizes (handles revocation carried by `other`'s key_auth).
-        self.records.retain(|_, rec| ka.authorizes(&rec.by));
-        // 3. Consider the other side's records, but only authorized ones.
         for (sid, orec) in &other.records {
-            if !ka.authorizes(&orec.by) {
-                continue;
-            }
             let take = self
                 .records
                 .get(sid)
@@ -140,15 +119,15 @@ impl IndexState {
                     ka.body.authorized.len()
                 ));
             }
-            let take = self
-                .key_auth
-                .as_ref()
-                .map_or(true, |cur| key_auth_order(ka) > key_auth_order(cur));
-            if take {
-                self.key_auth = Some(ka.clone());
-                // Revocation: drop existing records the new key_auth no longer
-                // authorizes, so a revoked key's content cannot linger.
-                self.records.retain(|_, rec| ka.authorizes(&rec.by));
+            // key_auth is immutable in 0.1: adopt only to initialize from empty;
+            // an identical re-send is idempotent; anything else (rotation) is
+            // rejected. This keeps the merge a clean associative monoid.
+            match &self.key_auth {
+                None => self.key_auth = Some(ka.clone()),
+                Some(cur) if cur == ka => {}
+                Some(_) => {
+                    return Err("key_auth is immutable in this version".to_string())
+                }
             }
         }
         let ka = self
@@ -421,65 +400,78 @@ mod tests {
     }
 
     #[test]
-    fn revoked_key_cannot_resurrect_via_merge() {
-        let (root, k1, k2) = (key(), key(), key());
-        let p = params(&root);
-        let id = sid(1);
+    fn merge_is_associative() {
+        let (root, online) = (key(), key());
+        let ka = key_auth(&root, &online, 1);
+        let mk = |recs: Vec<SignedRecord>| {
+            let mut s = IndexState::initialized(ka.clone());
+            for r in recs {
+                s.records.insert(r.body.subject_id().clone(), r);
+            }
+            s
+        };
+        let a = mk(vec![signed(RecordBody::Live(entry(&sid(1), 1, "a1")), &online)]);
+        let b = mk(vec![
+            signed(RecordBody::Live(entry(&sid(1), 2, "a2")), &online), // newer for sid 1
+            signed(RecordBody::Live(entry(&sid(2), 1, "b")), &online),
+        ]);
+        let c = mk(vec![
+            signed(
+                RecordBody::Tomb(Tombstone {
+                    subject_id: sid(2),
+                    version: 2,
+                }),
+                &online,
+            ),
+            signed(RecordBody::Live(entry(&sid(3), 1, "c")), &online),
+        ]);
 
-        // Legitimate current state under key_auth v2 (only k2 authorized).
-        let mut current = IndexState::initialized(key_auth(&root, &k2, 2));
-        current
-            .records
-            .insert(id.clone(), signed(RecordBody::Live(entry(&id, 2, "legit")), &k2));
-        assert!(current.verify(&p).is_ok());
+        let mut left = a.clone();
+        left.merge(&b);
+        left.merge(&c);
+        let mut bc = b.clone();
+        bc.merge(&c);
+        let mut right = a.clone();
+        right.merge(&bc);
+        assert_eq!(left, right, "merge must be associative");
 
-        // Attacker holds an old state under key_auth v1 (k1) with a HIGHER-version
-        // record signed by the now-revoked k1. It's valid under its own key_auth.
-        let mut attacker = IndexState::initialized(key_auth(&root, &k1, 1));
-        attacker
-            .records
-            .insert(id.clone(), signed(RecordBody::Live(entry(&id, 9, "evil")), &k1));
-        assert!(attacker.verify(&p).is_ok());
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab, ba, "merge must be commutative");
 
-        let mut a = current.clone();
-        a.merge(&attacker);
-        let mut b = attacker.clone();
-        b.merge(&current);
-        assert_eq!(a, b, "merge must converge regardless of order");
-        assert!(a.verify(&p).is_ok(), "merged state must satisfy verify()");
-        assert_eq!(
-            a.records.get(&id).unwrap().body.version(),
-            2,
-            "legit v2 wins; the revoked key's higher-version record is excluded, not resurrected"
-        );
+        assert_eq!(left.records.get(&sid(1)).unwrap().body.version(), 2);
+        assert_eq!(left.live_entries().count(), 2); // sid 1 + sid 3; sid 2 tombstoned
+        assert!(left.verify(&params(&root)).is_ok());
     }
 
     #[test]
-    fn revocation_via_delta_drops_old_records() {
+    fn key_auth_is_immutable() {
         let (root, k1, k2) = (key(), key(), key());
         let p = params(&root);
-        let id = sid(1);
         let mut s = IndexState::initialized(key_auth(&root, &k1, 1));
+        // A delta attempting to rotate to a different (even root-signed) key_auth
+        // is rejected: key_auth is immutable in 0.1.
+        let err = s
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: Some(key_auth(&root, &k2, 2)),
+                    records: vec![],
+                },
+                &p,
+            )
+            .unwrap_err();
+        assert!(err.contains("immutable"), "got: {err}");
+        // Re-sending the identical key_auth is idempotent.
         s.apply_delta(
             &IndexDelta {
-                key_auth: None,
-                records: vec![signed(RecordBody::Live(entry(&id, 1, "x")), &k1)],
-            },
-            &p,
-        )
-        .unwrap();
-        assert_eq!(s.live_entries().count(), 1);
-        // A delta that revokes k1 (authorizes only k2) must drop k1's record.
-        s.apply_delta(
-            &IndexDelta {
-                key_auth: Some(key_auth(&root, &k2, 2)),
+                key_auth: Some(key_auth(&root, &k1, 1)),
                 records: vec![],
             },
             &p,
         )
         .unwrap();
-        assert_eq!(s.live_entries().count(), 0);
-        assert!(s.verify(&p).is_ok());
     }
 
     #[test]
