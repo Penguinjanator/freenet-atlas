@@ -10,15 +10,14 @@ framework for publishing signed metadata and building many competing,
 pluralistic discovery systems on top of it. Users stay in control of which
 analyzers, indexes, curators, and ranking policies they trust.
 
-## UI mockup
+## UI
 
-The image below is an early **mockup** of the default Atlas browsing
-experience, meant only to convey the intended feel: quick, friendly, and
-immediately useful, with no setup or learning curve. It is a design sketch.
-The UI has not been built yet, and the real thing will probably look quite
-different.
+A first version of the Atlas browsing experience is built and running on
+Freenet: open it, search, and open what you find, with no setup or learning
+curve. The screenshot below is the live UI. Its entries are gathered
+automatically by a crawler that describes each resource with an LLM.
 
-![Mockup of the Atlas discovery UI](atlas-screenshot.png)
+![The Atlas discovery UI](atlas-screenshot.png)
 
 ## Status
 
