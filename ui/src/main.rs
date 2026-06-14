@@ -17,7 +17,7 @@ use wasm_bindgen_futures::spawn_local;
 /// same UI can target a test index. Default is the local-dev index.
 const INDEX_ID: &str = match option_env!("ATLAS_INDEX_ID") {
     Some(s) => s,
-    None => "9n477QMaBNXLWq5G5x3K1LohpdyH7bvg5ccUDtDwqLj6",
+    None => "G2Zw6Evsz5D2xNmBKWaiekBR9gwYKNa2aXNzirgZUn6K",
 };
 
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);

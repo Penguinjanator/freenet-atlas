@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{IndexEntry, IndexParams, KeyAuth, RecordBody, SignedRecord, SubjectId};
-use crate::MAX_ENTRIES;
+use crate::{MAX_AUTHORIZED, MAX_ENTRIES};
 
 /// The full index state: a root-signed authorization of online keys, plus one
 /// current record per subject. Records merge as a commutative monoid (per-subject
@@ -32,9 +32,14 @@ pub struct IndexDelta {
 }
 
 /// Total order used to resolve which record wins for a subject. Higher version
-/// wins; ties break deterministically on signature bytes so merge is commutative.
-fn record_order(r: &SignedRecord) -> (u64, [u8; 64]) {
-    (r.body.version(), r.sig.to_bytes())
+/// wins; at equal version a tombstone wins over a live entry (so a takedown is
+/// never silently lost to a same-version entry); remaining ties break
+/// deterministically on signature bytes so merge is commutative. Determinism of
+/// the sig tie-break relies on signature non-malleability, which is why
+/// verification uses `verify_strict` (see `crate::verify`).
+fn record_order(r: &SignedRecord) -> (u64, bool, [u8; 64]) {
+    let is_tomb = matches!(r.body, RecordBody::Tomb(_));
+    (r.body.version(), is_tomb, r.sig.to_bytes())
 }
 
 fn key_auth_order(k: &KeyAuth) -> (u64, [u8; 64]) {
@@ -55,6 +60,12 @@ impl IndexState {
     pub fn verify(&self, params: &IndexParams) -> Result<(), String> {
         let ka = self.key_auth.as_ref().ok_or("index has no key_auth")?;
         ka.verify_sig(&params.root_vk)?;
+        if ka.body.authorized.len() > MAX_AUTHORIZED {
+            return Err(format!(
+                "key_auth authorizes too many keys: {}",
+                ka.body.authorized.len()
+            ));
+        }
         if self.records.len() > MAX_ENTRIES {
             return Err(format!("too many records: {}", self.records.len()));
         }
@@ -71,9 +82,18 @@ impl IndexState {
         Ok(())
     }
 
-    /// Merge another already-valid state into this one (both sides assumed
-    /// verified). Commutative, associative, idempotent.
+    /// Merge another already-sig-verified state into this one. Commutative,
+    /// associative, idempotent.
+    ///
+    /// Authorization is applied *against the final (merged) key_auth* and gates
+    /// record selection, not just a post-filter. This is what makes revocation
+    /// safe: when the winning key_auth de-authorizes a key, records signed by
+    /// that key are never even considered, so they can neither resurrect (win on
+    /// version then persist) nor grief (win on version then get filtered,
+    /// erasing the legitimate record). Records by keys the final key_auth still
+    /// authorizes are selected per-subject by `record_order`.
     pub fn merge(&mut self, other: &IndexState) {
+        // 1. Resolve the final key_auth (higher version wins).
         if let Some(oka) = &other.key_auth {
             let take = self
                 .key_auth
@@ -83,7 +103,22 @@ impl IndexState {
                 self.key_auth = Some(oka.clone());
             }
         }
+        let ka = match self.key_auth.clone() {
+            Some(ka) => ka,
+            None => {
+                // No authority yet: nothing can be authorized.
+                self.records.clear();
+                return;
+            }
+        };
+        // 2. Drop any of our existing records the final key_auth no longer
+        //    authorizes (handles revocation carried by `other`'s key_auth).
+        self.records.retain(|_, rec| ka.authorizes(&rec.by));
+        // 3. Consider the other side's records, but only authorized ones.
         for (sid, orec) in &other.records {
+            if !ka.authorizes(&orec.by) {
+                continue;
+            }
             let take = self
                 .records
                 .get(sid)
@@ -99,12 +134,21 @@ impl IndexState {
     pub fn apply_delta(&mut self, delta: &IndexDelta, params: &IndexParams) -> Result<(), String> {
         if let Some(ka) = &delta.key_auth {
             ka.verify_sig(&params.root_vk)?;
+            if ka.body.authorized.len() > MAX_AUTHORIZED {
+                return Err(format!(
+                    "key_auth authorizes too many keys: {}",
+                    ka.body.authorized.len()
+                ));
+            }
             let take = self
                 .key_auth
                 .as_ref()
                 .map_or(true, |cur| key_auth_order(ka) > key_auth_order(cur));
             if take {
                 self.key_auth = Some(ka.clone());
+                // Revocation: drop existing records the new key_auth no longer
+                // authorizes, so a revoked key's content cannot linger.
+                self.records.retain(|_, rec| ka.authorizes(&rec.by));
             }
         }
         let ka = self
@@ -374,5 +418,100 @@ mod tests {
         let bytes = p.to_bytes();
         let back = IndexParams::from_bytes(&bytes).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn revoked_key_cannot_resurrect_via_merge() {
+        let (root, k1, k2) = (key(), key(), key());
+        let p = params(&root);
+        let id = sid(1);
+
+        // Legitimate current state under key_auth v2 (only k2 authorized).
+        let mut current = IndexState::initialized(key_auth(&root, &k2, 2));
+        current
+            .records
+            .insert(id.clone(), signed(RecordBody::Live(entry(&id, 2, "legit")), &k2));
+        assert!(current.verify(&p).is_ok());
+
+        // Attacker holds an old state under key_auth v1 (k1) with a HIGHER-version
+        // record signed by the now-revoked k1. It's valid under its own key_auth.
+        let mut attacker = IndexState::initialized(key_auth(&root, &k1, 1));
+        attacker
+            .records
+            .insert(id.clone(), signed(RecordBody::Live(entry(&id, 9, "evil")), &k1));
+        assert!(attacker.verify(&p).is_ok());
+
+        let mut a = current.clone();
+        a.merge(&attacker);
+        let mut b = attacker.clone();
+        b.merge(&current);
+        assert_eq!(a, b, "merge must converge regardless of order");
+        assert!(a.verify(&p).is_ok(), "merged state must satisfy verify()");
+        assert_eq!(
+            a.records.get(&id).unwrap().body.version(),
+            2,
+            "legit v2 wins; the revoked key's higher-version record is excluded, not resurrected"
+        );
+    }
+
+    #[test]
+    fn revocation_via_delta_drops_old_records() {
+        let (root, k1, k2) = (key(), key(), key());
+        let p = params(&root);
+        let id = sid(1);
+        let mut s = IndexState::initialized(key_auth(&root, &k1, 1));
+        s.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![signed(RecordBody::Live(entry(&id, 1, "x")), &k1)],
+            },
+            &p,
+        )
+        .unwrap();
+        assert_eq!(s.live_entries().count(), 1);
+        // A delta that revokes k1 (authorizes only k2) must drop k1's record.
+        s.apply_delta(
+            &IndexDelta {
+                key_auth: Some(key_auth(&root, &k2, 2)),
+                records: vec![],
+            },
+            &p,
+        )
+        .unwrap();
+        assert_eq!(s.live_entries().count(), 0);
+        assert!(s.verify(&p).is_ok());
+    }
+
+    #[test]
+    fn tombstone_wins_at_equal_version() {
+        let (root, online) = (key(), key());
+        let p = params(&root);
+        let id = sid(1);
+        let live = signed(RecordBody::Live(entry(&id, 5, "x")), &online);
+        let tomb = signed(
+            RecordBody::Tomb(Tombstone {
+                subject_id: id.clone(),
+                version: 5,
+            }),
+            &online,
+        );
+        for order in [[live.clone(), tomb.clone()], [tomb.clone(), live.clone()]] {
+            let mut s = IndexState::initialized(key_auth(&root, &online, 1));
+            for rec in order {
+                s.apply_delta(
+                    &IndexDelta {
+                        key_auth: None,
+                        records: vec![rec],
+                    },
+                    &p,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                s.live_entries().count(),
+                0,
+                "tombstone wins at equal version regardless of arrival order"
+            );
+        }
     }
 }

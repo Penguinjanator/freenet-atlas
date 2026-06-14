@@ -7,7 +7,7 @@
 //! contract enforces only signatures, authorization, structure, bounds, and the
 //! versioned merge.
 
-use atlas_common::{IndexDelta, IndexParams, IndexState, IndexSummary, MAX_ENTRIES};
+use atlas_common::{IndexDelta, IndexParams, IndexState, IndexSummary};
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_stdlib::prelude::ContractError;
 use freenet_stdlib::prelude::*;
@@ -96,13 +96,12 @@ impl ContractInterface for AtlasIndex {
             }
         }
 
-        // Merging two valid states can exceed the bound even though each side was
-        // within it; apply_delta already checks, but a State merge does not.
-        if st.records.len() > MAX_ENTRIES {
-            return Err(ContractError::InvalidUpdateWithInfo {
-                reason: format!("merged index exceeds {MAX_ENTRIES} records"),
-            });
-        }
+        // Defense in depth: the merged result must satisfy the same invariant as
+        // validate_state (signatures, authorization against the final key_auth,
+        // bounds). The merge logic already guarantees this; re-checking ensures
+        // update_state can never emit a state its own validate_state rejects.
+        st.verify(&params)
+            .map_err(|reason| ContractError::InvalidUpdateWithInfo { reason })?;
 
         let mut out = Vec::new();
         into_writer(&st, &mut out).map_err(|e| ContractError::Deser(e.to_string()))?;

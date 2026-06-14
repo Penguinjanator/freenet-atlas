@@ -14,7 +14,8 @@ use atlas_common::{
     Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
 };
 use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer, SigningKey};
+use serde::Serialize;
 
 use api::NodeClient;
 
@@ -72,6 +73,32 @@ enum Cmd {
     Show,
     /// Print the index contract id (no network).
     Key,
+    /// Write the web-container params (root vk) and print its contract id
+    /// (needed for the UI base_path). Reuses the root key as the UI owner.
+    WebappParams {
+        /// Path to the (generic) web-container contract wasm.
+        #[arg(long)]
+        wasm: PathBuf,
+        #[arg(long)]
+        out_params: PathBuf,
+    },
+    /// Sign a compressed webapp archive into web-container metadata (CBOR).
+    WebappSign {
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        version: u32,
+        #[arg(long)]
+        out_meta: PathBuf,
+    },
+}
+
+/// Mirrors River's web-container metadata so the generic web-container contract
+/// accepts our signed webapp. Signature covers `version.to_be_bytes() || webapp`.
+#[derive(Serialize)]
+struct WebContainerMetadata {
+    version: u32,
+    signature: Signature,
 }
 
 #[tokio::main]
@@ -105,7 +132,37 @@ async fn main() -> Result<()> {
             println!("{}", key.id());
             Ok(())
         }
+        Cmd::WebappParams { wasm, out_params } => webapp_params(&dir, wasm, out_params),
+        Cmd::WebappSign {
+            archive,
+            version,
+            out_meta,
+        } => webapp_sign(&dir, archive, *version, out_meta),
     }
+}
+
+fn webapp_params(dir: &Path, wasm: &Path, out_params: &Path) -> Result<()> {
+    let root = load_key(&dir.join("root.key"))?;
+    let vk = root.verifying_key();
+    fs::write(out_params, vk.as_bytes()).with_context(|| format!("writing {}", out_params.display()))?;
+    let code = fs::read(wasm).with_context(|| format!("reading {}", wasm.display()))?;
+    let key = NodeClient::contract_key(&code, vk.as_bytes());
+    println!("{}", key.id());
+    Ok(())
+}
+
+fn webapp_sign(dir: &Path, archive: &Path, version: u32, out_meta: &Path) -> Result<()> {
+    let root = load_key(&dir.join("root.key"))?;
+    let webapp = fs::read(archive).with_context(|| format!("reading {}", archive.display()))?;
+    let mut message = Vec::with_capacity(4 + webapp.len());
+    message.extend_from_slice(&version.to_be_bytes());
+    message.extend_from_slice(&webapp);
+    let signature = root.sign(&message);
+    let meta = WebContainerMetadata { version, signature };
+    let bytes = encode(&meta)?;
+    fs::write(out_meta, bytes).with_context(|| format!("writing {}", out_meta.display()))?;
+    println!("signed webapp v{version} -> {}", out_meta.display());
+    Ok(())
 }
 
 fn keygen(dir: &Path) -> Result<()> {

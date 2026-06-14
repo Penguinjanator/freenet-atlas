@@ -6,7 +6,7 @@
 //! that needs a CSPRNG (key generation, random subject ids) lives behind the
 //! `rng` feature, which only the native crates enable.
 
-use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
 mod state;
@@ -22,6 +22,10 @@ pub use types::{
 /// cold-fetch budget; the node also hard-caps contract state at 50 MiB. Beyond
 /// this, the index shards (see the design doc, "Scaling beyond one contract").
 pub const MAX_ENTRIES: usize = 20_000;
+/// Cap on online keys a single key_auth may authorize (bounds verify cost and
+/// state size; only the root can set this, but a fat-fingered list shouldn't
+/// bloat the index).
+pub const MAX_AUTHORIZED: usize = 32;
 pub const MAX_TITLE: usize = 200;
 pub const MAX_SNIPPET: usize = 500;
 pub const MAX_TAGS: usize = 16;
@@ -47,7 +51,11 @@ pub fn verify<T: Serialize>(
     sig: &Signature,
     vk: &VerifyingKey,
 ) -> Result<(), SignatureError> {
-    vk.verify(&canonical(value), sig)
+    // verify_strict (not verify) so the per-record (version, sig) merge tie-break
+    // rests on non-malleable signatures: it rejects small-order keys and
+    // non-canonical R, closing signature-malleability that could otherwise let
+    // two distinct valid signatures exist for one (key, message).
+    vk.verify_strict(&canonical(value), sig)
 }
 
 /// Generate a fresh signing key (native crates only).
