@@ -12,3 +12,11 @@ freenet-stdlib = { workspace = true, features = ["contract"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+# The `#[contract]` macro gates its FFI exports (validate_state, update_state,
+# ...) behind `freenet-main-contract`, so it must be on for the WASM to export
+# anything. Mirrors River's room-contract.
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+contract = ["freenet-stdlib/contract"]
