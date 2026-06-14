@@ -1,0 +1,327 @@
+//! atlasctl: the Atlas curator CLI. Manages the single-writer index contract on
+//! a Freenet node. The root key authorizes an online signing key; entries are
+//! signed by the online key and merged into the index by per-subject version.
+
+mod api;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Context, Result};
+use atlas_common::{
+    generate_key, sign, IndexDelta, IndexEntry, IndexParams, IndexState, KeyAuth, KeyAuthBody, Kind,
+    Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
+};
+use clap::{Parser, Subcommand};
+use ed25519_dalek::SigningKey;
+
+use api::NodeClient;
+
+const CONTRACT_WASM: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
+const DEFAULT_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
+
+#[derive(Parser)]
+#[command(name = "atlasctl", version, about = "Atlas curator CLI")]
+struct Cli {
+    /// Node WebSocket URL.
+    #[arg(long, default_value = DEFAULT_URL, global = true)]
+    node: String,
+    /// Key directory holding root.key and online.key (default: ~/.config/atlas).
+    #[arg(long, global = true)]
+    key_dir: Option<PathBuf>,
+    /// Index slug (discriminates contract instances under the same root key).
+    #[arg(long, default_value = "default", global = true)]
+    slug: String,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Generate the root and online signing keys.
+    Keygen,
+    /// PUT a fresh, empty index (root authorizes the online key).
+    Init,
+    /// Add a new subject (mints a subject id at version 1).
+    Add {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        snippet: String,
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+        /// `freenet:<full-id><path>` or `https://...`
+        #[arg(long)]
+        locator: String,
+        #[arg(long)]
+        featured: bool,
+    },
+    /// Tombstone a subject by id (needs the current version to supersede it).
+    Remove {
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        cur_version: u64,
+    },
+    /// GET and print the index's live entries.
+    Show,
+    /// Print the index contract id (no network).
+    Key,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let dir = resolve_key_dir(&cli.key_dir);
+    match &cli.cmd {
+        Cmd::Keygen => keygen(&dir),
+        Cmd::Init => init(&cli, &dir).await,
+        Cmd::Add {
+            kind,
+            title,
+            snippet,
+            tags,
+            locator,
+            featured,
+        } => {
+            add(
+                &cli, &dir, kind, title, snippet, tags, locator, *featured,
+            )
+            .await
+        }
+        Cmd::Remove {
+            subject,
+            cur_version,
+        } => remove(&cli, &dir, subject, *cur_version).await,
+        Cmd::Show => show(&cli, &dir).await,
+        Cmd::Key => {
+            let params = params_bytes(&dir, &cli.slug)?;
+            let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+            println!("{}", key.id());
+            Ok(())
+        }
+    }
+}
+
+fn keygen(dir: &Path) -> Result<()> {
+    let root = generate_key();
+    let online = generate_key();
+    save_key(&dir.join("root.key"), &root)?;
+    save_key(&dir.join("online.key"), &online)?;
+    println!("keys written to {}", dir.display());
+    println!("root_vk:   {}", b58(root.verifying_key().as_bytes()));
+    println!("online_vk: {}", b58(online.verifying_key().as_bytes()));
+    println!("\nKeep root.key offline once the index is initialized; the online key is the hot signer.");
+    Ok(())
+}
+
+async fn init(cli: &Cli, dir: &Path) -> Result<()> {
+    let root = load_key(&dir.join("root.key"))?;
+    let online = load_key(&dir.join("online.key"))?;
+    let body = KeyAuthBody {
+        version: 1,
+        authorized: vec![online.verifying_key()],
+    };
+    let key_auth = KeyAuth {
+        sig: sign(&body, &root),
+        body,
+    };
+    let state = encode(&IndexState::initialized(key_auth))?;
+    let params = IndexParams {
+        root_vk: root.verifying_key(),
+        slug: cli.slug.clone(),
+    }
+    .to_bytes();
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let key = client.put(CONTRACT_WASM, params, state).await?;
+    println!("index initialized");
+    println!("contract id: {}", key.id());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn add(
+    cli: &Cli,
+    dir: &Path,
+    kind: &str,
+    title: &str,
+    snippet: &str,
+    tags: &str,
+    locator: &str,
+    featured: bool,
+) -> Result<()> {
+    let online = load_key(&dir.join("online.key"))?;
+    let entry = IndexEntry {
+        subject_id: SubjectId::random(),
+        version: 1,
+        kind: parse_kind(kind)?,
+        title: title.to_string(),
+        snippet: snippet.to_string(),
+        tags: split_tags(tags),
+        locator: parse_locator(locator)?,
+        featured,
+        added_at: now_secs(),
+    };
+    let subject = entry.subject_id.as_str().to_string();
+    let body = RecordBody::Live(entry);
+    let rec = SignedRecord {
+        sig: sign(&body, &online),
+        by: online.verifying_key(),
+        body,
+    };
+    send_delta(cli, dir, vec![rec]).await?;
+    println!("added subject {subject}");
+    Ok(())
+}
+
+async fn remove(cli: &Cli, dir: &Path, subject: &str, cur_version: u64) -> Result<()> {
+    let online = load_key(&dir.join("online.key"))?;
+    let subject_id = SubjectId::parse(subject).ok_or_else(|| anyhow!("malformed subject id"))?;
+    let body = RecordBody::Tomb(Tombstone {
+        subject_id,
+        version: cur_version + 1,
+    });
+    let rec = SignedRecord {
+        sig: sign(&body, &online),
+        by: online.verifying_key(),
+        body,
+    };
+    send_delta(cli, dir, vec![rec]).await?;
+    println!("removed subject {subject}");
+    Ok(())
+}
+
+async fn show(cli: &Cli, dir: &Path) -> Result<()> {
+    let params = params_bytes(dir, &cli.slug)?;
+    let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let bytes = client.get(&key).await?;
+    if bytes.is_empty() {
+        println!("(index is empty / not initialized)");
+        return Ok(());
+    }
+    let state: IndexState =
+        ciborium::de::from_reader(&bytes[..]).context("decoding index state")?;
+    let mut entries: Vec<_> = state.live_entries().collect();
+    entries.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+    println!("{} live entries:", entries.len());
+    for e in entries {
+        let star = if e.featured { "★ " } else { "  " };
+        println!(
+            "{star}{}  [{:?}]  {}\n     {}\n     {}",
+            e.subject_id.as_str(),
+            e.kind,
+            e.title,
+            e.snippet,
+            e.locator.to_uri()
+        );
+    }
+    Ok(())
+}
+
+async fn send_delta(cli: &Cli, dir: &Path, records: Vec<SignedRecord>) -> Result<()> {
+    let delta = encode(&IndexDelta {
+        key_auth: None,
+        records,
+    })?;
+    let params = params_bytes(dir, &cli.slug)?;
+    let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+    let mut client = NodeClient::connect(&cli.node).await?;
+    client.update_delta(key, delta).await
+}
+
+fn params_bytes(dir: &Path, slug: &str) -> Result<Vec<u8>> {
+    let root = load_key(&dir.join("root.key"))?;
+    Ok(IndexParams {
+        root_vk: root.verifying_key(),
+        slug: slug.to_string(),
+    }
+    .to_bytes())
+}
+
+// --- helpers ---
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(value, &mut buf)?;
+    Ok(buf)
+}
+
+fn resolve_key_dir(opt: &Option<PathBuf>) -> PathBuf {
+    opt.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".config/atlas")
+    })
+}
+
+fn save_key(path: &Path, key: &SigningKey) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, key.to_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn load_key(path: &Path) -> Result<SigningKey> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("{} is not a 32-byte key", path.display()))?;
+    Ok(SigningKey::from_bytes(&arr))
+}
+
+fn parse_kind(s: &str) -> Result<Kind> {
+    Ok(match s.to_lowercase().as_str() {
+        "app" => Kind::App,
+        "site" => Kind::Site,
+        "external" => Kind::External,
+        other => bail!("unknown kind '{other}' (expected app|site|external)"),
+    })
+}
+
+fn parse_locator(s: &str) -> Result<Locator> {
+    if let Some(rest) = s.strip_prefix("freenet:") {
+        let is_b58 = |c: char| {
+            matches!(c,
+                '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
+        };
+        let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
+        let loc = Locator::Freenet {
+            contract_id: rest[..id_end].to_string(),
+            path: rest[id_end..].to_string(),
+        };
+        loc.check().map_err(|e| anyhow!("{e}"))?;
+        Ok(loc)
+    } else if s.starts_with("https://") {
+        let loc = Locator::External { url: s.to_string() };
+        loc.check().map_err(|e| anyhow!("{e}"))?;
+        Ok(loc)
+    } else {
+        bail!("locator must start with `freenet:` or `https://`")
+    }
+}
+
+fn split_tags(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn b58(bytes: &[u8]) -> String {
+    bs58::encode(bytes).into_string()
+}
