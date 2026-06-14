@@ -11,6 +11,7 @@ use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, Error, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::ContractInstanceId;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 /// The index contract instance id. Baked in at build time; overridable so the
@@ -68,7 +69,10 @@ fn main() {
 }
 
 fn App() -> Element {
-    use_hook(|| connect());
+    use_hook(|| {
+        set_shell_title("Atlas");
+        connect();
+    });
     let mut query = use_signal(String::new);
     let q = query().to_lowercase();
 
@@ -139,6 +143,26 @@ fn EntryCard(entry: IndexEntry) -> Element {
             }
         }
     }
+}
+
+/// Set the browser tab title. When served by the Freenet gateway the app runs in
+/// a sandboxed iframe whose parent "shell" owns the tab (and defaults its title
+/// to "Freenet"), so we both set our own document title and postMessage the
+/// title to the parent shell via its `__freenet_shell__` bridge (same mechanism
+/// River uses).
+fn set_shell_title(title: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    if let Some(doc) = window.document() {
+        doc.set_title(title);
+    }
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("__freenet_shell__"), &JsValue::TRUE);
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("title"));
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("title"), &JsValue::from_str(title));
+    let target = window.parent().ok().flatten().unwrap_or_else(|| window.clone());
+    let _ = target.post_message(&JsValue::from(msg), "*");
 }
 
 fn connect() {
