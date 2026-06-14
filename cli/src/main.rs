@@ -112,6 +112,18 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Repair a stale replica: GET the index state from a source node and PUT it
+    /// into a target node so that node serves the current state locally. Useful
+    /// while cross-node subscribe/propagation is unreliable (the target may hold
+    /// an old copy it can't refresh because its subscribe dead-ends).
+    PushState {
+        /// Source node holding the authoritative current state.
+        #[arg(long, default_value = DEFAULT_URL)]
+        from: String,
+        /// Target node to push the state into (e.g. a tunnel to a stale node).
+        #[arg(long)]
+        to: String,
+    },
 }
 
 /// Mirrors River's web-container metadata so the generic web-container contract
@@ -165,6 +177,45 @@ async fn main() -> Result<()> {
             metadata,
         } => webapp_put(&cli, &dir, wasm, archive, metadata).await,
         Cmd::RawGet { instance, out } => raw_get(&cli, instance, out).await,
+        Cmd::PushState { from, to } => push_state(&dir, &cli.slug, from, to).await,
+    }
+}
+
+/// GET the index state from `from` and PUT it into `to`. The target merges it
+/// (per-subject LWW) into whatever stale copy it holds, so it ends up serving
+/// the current state locally. Records are already signed by the online key, so
+/// no re-signing is needed; the target contract verifies them on update.
+async fn push_state(dir: &Path, slug: &str, from: &str, to: &str) -> Result<()> {
+    let params = params_bytes(dir, slug)?;
+    let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+    println!("index {}", key.id());
+
+    let mut src = NodeClient::connect(from).await?;
+    let state = src.get(&key, false).await?;
+    let live_src = count_live(&state);
+    println!("source has {live_src} live entries ({} bytes)", state.len());
+
+    // PUT-over-existing on the target is applied as a merging update; subscribe
+    // is left off so we don't block on the target's dead-ending subscribe.
+    let mut dst = NodeClient::connect(to).await?;
+    dst.put(CONTRACT_WASM, params, state, false).await?;
+    println!("pushed state to {to}");
+
+    // Read the target back to confirm it now serves the current state.
+    let after = dst.get(&key, false).await?;
+    println!("target now has {} live entries", count_live(&after));
+    Ok(())
+}
+
+/// Decode an index state and count live (non-tombstoned) entries; 0 if empty or
+/// undecodable (best-effort, for logging only).
+fn count_live(state: &[u8]) -> usize {
+    if state.is_empty() {
+        return 0;
+    }
+    match ciborium::de::from_reader::<IndexState, &[u8]>(state) {
+        Ok(st) => st.live_entries().count(),
+        Err(_) => 0,
     }
 }
 
