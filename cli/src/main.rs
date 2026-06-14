@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use atlas_common::{
-    generate_key, sign, IndexDelta, IndexEntry, IndexParams, IndexState, KeyAuth, KeyAuthBody, Kind,
-    Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
+    generate_key, sign, IndexDelta, IndexEntry, IndexParams, IndexState, KeyAuth, KeyAuthBody,
+    Kind, Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
 };
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey};
@@ -20,8 +20,7 @@ use serde::Serialize;
 use api::NodeClient;
 use freenet_stdlib::prelude::ContractInstanceId;
 
-const CONTRACT_WASM: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
+const CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
 const DEFAULT_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
 
 #[derive(Parser)]
@@ -148,12 +147,7 @@ async fn main() -> Result<()> {
             tags,
             locator,
             featured,
-        } => {
-            add(
-                &cli, &dir, kind, title, snippet, tags, locator, *featured,
-            )
-            .await
-        }
+        } => add(&cli, &dir, kind, title, snippet, tags, locator, *featured).await,
         Cmd::Remove {
             subject,
             cur_version,
@@ -220,7 +214,9 @@ fn count_live(state: &[u8]) -> usize {
 }
 
 async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
-    let id: ContractInstanceId = instance.parse().map_err(|e| anyhow!("bad instance id: {e}"))?;
+    let id: ContractInstanceId = instance
+        .parse()
+        .map_err(|e| anyhow!("bad instance id: {e}"))?;
     let mut client = NodeClient::connect(&cli.node).await?;
     let bytes = client.get_instance(id).await?;
     fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
@@ -228,7 +224,13 @@ async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn webapp_put(cli: &Cli, dir: &Path, wasm: &Path, archive: &Path, metadata: &Path) -> Result<()> {
+async fn webapp_put(
+    cli: &Cli,
+    dir: &Path,
+    wasm: &Path,
+    archive: &Path,
+    metadata: &Path,
+) -> Result<()> {
     let root = load_key(&dir.join("root.key"))?;
     let params = root.verifying_key().as_bytes().to_vec();
     let code = fs::read(wasm).with_context(|| format!("reading {}", wasm.display()))?;
@@ -250,7 +252,8 @@ async fn webapp_put(cli: &Cli, dir: &Path, wasm: &Path, archive: &Path, metadata
 fn webapp_params(dir: &Path, wasm: &Path, out_params: &Path) -> Result<()> {
     let root = load_key(&dir.join("root.key"))?;
     let vk = root.verifying_key();
-    fs::write(out_params, vk.as_bytes()).with_context(|| format!("writing {}", out_params.display()))?;
+    fs::write(out_params, vk.as_bytes())
+        .with_context(|| format!("writing {}", out_params.display()))?;
     let code = fs::read(wasm).with_context(|| format!("reading {}", wasm.display()))?;
     let key = NodeClient::contract_key(&code, vk.as_bytes());
     println!("{}", key.id());
@@ -279,7 +282,9 @@ fn keygen(dir: &Path) -> Result<()> {
     println!("keys written to {}", dir.display());
     println!("root_vk:   {}", b58(root.verifying_key().as_bytes()));
     println!("online_vk: {}", b58(online.verifying_key().as_bytes()));
-    println!("\nKeep root.key offline once the index is initialized; the online key is the hot signer.");
+    println!(
+        "\nKeep root.key offline once the index is initialized; the online key is the hot signer."
+    );
     Ok(())
 }
 

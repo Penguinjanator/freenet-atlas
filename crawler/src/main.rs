@@ -25,7 +25,10 @@ const FETCH_TIMEOUT_SECS: u64 = 15;
 #[derive(Parser)]
 #[command(name = "atlas-crawler", about = "Automated Atlas curator")]
 struct Cli {
-    #[arg(long, default_value = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native")]
+    #[arg(
+        long,
+        default_value = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native"
+    )]
     node: String,
     #[arg(long)]
     key_dir: Option<PathBuf>,
@@ -95,7 +98,9 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
     let mut seen = load_seen(seen_path);
     let sources = fs::read_to_string(&cli.sources)
         .with_context(|| format!("reading sources {}", cli.sources.display()))?;
-    let key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
+    let key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
     if key.is_none() {
         eprintln!("OPENAI_API_KEY not set — using title/meta fallback descriptions");
     }
@@ -122,10 +127,20 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
         // `hub <url>` (or `hub: <url>`): a link repository — index the sites it
         // links to (ONE level; linked sites are NOT recursively crawled as hubs,
         // so work is bounded). A plain line is indexed directly.
-        if let Some(hub) = line.strip_prefix("hub ").or_else(|| line.strip_prefix("hub:")) {
+        if let Some(hub) = line
+            .strip_prefix("hub ")
+            .or_else(|| line.strip_prefix("hub:"))
+        {
             let hub = hub.trim().to_string();
             let (a, ok) = crawl_hub(
-                cli, &client, key.as_deref(), &gw, &hub, &mut seen, seen_path, cli.max - attempts,
+                cli,
+                &client,
+                key.as_deref(),
+                &gw,
+                &hub,
+                &mut seen,
+                seen_path,
+                cli.max - attempts,
             );
             attempts += a;
             added += ok;
@@ -146,7 +161,10 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
             }
         }
     }
-    eprintln!("run complete: {added} added / {attempts} attempted (cap {})", cli.max);
+    eprintln!(
+        "run complete: {added} added / {attempts} attempted (cap {})",
+        cli.max
+    );
     Ok(())
 }
 
@@ -231,7 +249,10 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
             }
         }
         let sep = if path.contains('?') { '&' } else { '?' };
-        let html = fetch(client, &format!("{gw}/v1/contract/web/{id}{path}{sep}__sandbox=1"))?;
+        let html = fetch(
+            client,
+            &format!("{gw}/v1/contract/web/{id}{path}{sep}__sandbox=1"),
+        )?;
         let text = visible_text(&html);
         Ok(Page { html, text })
     } else {
@@ -355,7 +376,9 @@ fn extract_locators(html: &str) -> Vec<(String, &'static str)> {
     let mut i = 0;
     while let Some(p) = lower[i..].find("href=\"") {
         let start = i + p + 6;
-        let Some(end_rel) = html[start..].find('"') else { break };
+        let Some(end_rel) = html[start..].find('"') else {
+            break;
+        };
         let href = decode_entities(html[start..start + end_rel].trim());
         i = start + end_rel + 1;
         if let Some((loc, kind)) = normalize_href(&href) {
@@ -368,9 +391,7 @@ fn extract_locators(html: &str) -> Vec<(String, &'static str)> {
 }
 
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
-    let is_b58 = |c: char| {
-        matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
-    };
+    let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
     // Gateway web URL (absolute or relative path) -> freenet:<id><path>
     if let Some(pos) = href.find("/v1/contract/web/") {
         let after = &href[pos + "/v1/contract/web/".len()..];
@@ -396,7 +417,10 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         return None;
     }
     if href.starts_with("https://") {
-        return Some((href.split('#').next().unwrap_or(href).to_string(), "external"));
+        return Some((
+            href.split('#').next().unwrap_or(href).to_string(),
+            "external",
+        ));
     }
     None
 }
@@ -404,10 +428,14 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
 /// True if a path points at a static asset (script/style/font/image/etc.) rather
 /// than a browsable page. Such links (e.g. a hub's own JS bundle) are not sites.
 fn is_asset_path(path: &str) -> bool {
-    let p = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
+    let p = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
     const EXT: &[&str] = &[
-        ".js", ".mjs", ".css", ".wasm", ".map", ".json", ".png", ".jpg", ".jpeg",
-        ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+        ".js", ".mjs", ".css", ".wasm", ".map", ".json", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".ico", ".webp", ".woff", ".woff2", ".ttf", ".otf", ".eot",
     ];
     EXT.iter().any(|e| p.ends_with(e))
 }
@@ -415,7 +443,8 @@ fn is_asset_path(path: &str) -> bool {
 /// The contract id of a `freenet:` locator (the part before any `/`, `#` or `?`),
 /// or None for non-freenet locators.
 fn freenet_id(loc: &str) -> Option<&str> {
-    loc.strip_prefix("freenet:").map(|rest| split_freenet(rest).0)
+    loc.strip_prefix("freenet:")
+        .map(|rest| split_freenet(rest).0)
 }
 
 /// Derive the gateway HTTP base (scheme://host:port) from the node WS URL.
@@ -436,9 +465,7 @@ fn gateway_http_base(node: &str) -> String {
 }
 
 fn split_freenet(rest: &str) -> (&str, &str) {
-    let is_b58 = |c: char| {
-        matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
-    };
+    let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
     let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
     (&rest[..id_end], &rest[id_end..])
 }
@@ -452,12 +479,17 @@ fn ssrf_check(url: &str) -> Result<()> {
         bail!("only https sources are supported");
     }
     let host = parsed.host_str().ok_or_else(|| anyhow!("no host"))?;
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") || host.ends_with(".internal") {
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
         bail!("local host blocked");
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         let blocked = match ip {
-            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
+            IpAddr::V4(v4) => {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+            }
             IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
         };
         if blocked {
@@ -477,7 +509,12 @@ fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn describe_llm(client: &reqwest::blocking::Client, key: &str, url: &str, text: &str) -> Result<Described> {
+fn describe_llm(
+    client: &reqwest::blocking::Client,
+    key: &str,
+    url: &str,
+    text: &str,
+) -> Result<Described> {
     let system = "You write neutral, factual one-line descriptions of web resources for a \
         directory. No marketing, no hype, no first person, no exclamation. Output STRICT JSON \
         with keys: title (short), snippet (one factual sentence), tags (array of up to 5 \
@@ -515,7 +552,8 @@ fn describe_llm(client: &reqwest::blocking::Client, key: &str, url: &str, text: 
     let content = json["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow!("no content in openai response"))?;
-    let parsed: serde_json::Value = serde_json::from_str(content).with_context(|| "llm json parse")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(content).with_context(|| "llm json parse")?;
     let title = parsed["title"].as_str().unwrap_or("").trim().to_string();
     let snippet = parsed["snippet"].as_str().unwrap_or("").trim().to_string();
     let tags = parsed["tags"]
@@ -530,7 +568,13 @@ fn describe_llm(client: &reqwest::blocking::Client, key: &str, url: &str, text: 
         .unwrap_or_default();
     // Default to "nsfw" (not indexed) if the model omits/garbles the rating, so a
     // missing classification fails safe rather than indexing unrated content.
-    let rating = match parsed["rating"].as_str().unwrap_or("").trim().to_lowercase().as_str() {
+    let rating = match parsed["rating"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+        .as_str()
+    {
         "ok" => "ok",
         "illegal" => "illegal",
         _ => "nsfw",
@@ -539,13 +583,23 @@ fn describe_llm(client: &reqwest::blocking::Client, key: &str, url: &str, text: 
     if title.is_empty() {
         bail!("llm returned empty title");
     }
-    Ok(Described { title, snippet, tags, rating })
+    Ok(Described {
+        title,
+        snippet,
+        tags,
+        rating,
+    })
 }
 
 fn describe_fallback(url: &str, html: &str) -> Described {
     let title = extract_tag(html, "<title>", "</title>")
         .or_else(|| extract_meta(html, "og:title"))
-        .unwrap_or_else(|| url::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_else(|| url.to_string()));
+        .unwrap_or_else(|| {
+            url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| url.to_string())
+        });
     let snippet = extract_meta(html, "description")
         .or_else(|| extract_meta(html, "og:description"))
         .unwrap_or_default();
@@ -575,7 +629,10 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
     cmd.args(["--locator", loc]);
     let out = cmd.output().with_context(|| "running atlasctl")?;
     if !out.status.success() {
-        bail!("atlasctl add failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "atlasctl add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     println!("added: {} ({loc})", d.title);
     Ok(())
@@ -583,7 +640,12 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
 
 fn load_seen(path: &Path) -> HashSet<String> {
     fs::read_to_string(path)
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -620,7 +682,10 @@ fn extract_meta(html: &str, name: &str) -> Option<String> {
         let abs = idx + pos;
         // find the enclosing tag bounds
         let tag_start = lower[..abs].rfind("<meta").unwrap_or(abs);
-        let tag_end = lower[abs..].find('>').map(|e| abs + e).unwrap_or(html.len());
+        let tag_end = lower[abs..]
+            .find('>')
+            .map(|e| abs + e)
+            .unwrap_or(html.len());
         let tag = &html[tag_start..tag_end];
         if let Some(c) = extract_attr(tag, "content") {
             if !c.trim().is_empty() {
@@ -703,7 +768,9 @@ mod tests {
         );
         // absolute gateway url, sandbox query dropped
         assert_eq!(
-            normalize_href(&format!("http://gw.example/v1/contract/web/{ID}/?__sandbox=1")),
+            normalize_href(&format!(
+                "http://gw.example/v1/contract/web/{ID}/?__sandbox=1"
+            )),
             Some((format!("freenet:{ID}/"), "site"))
         );
         // external https, fragment dropped
@@ -728,8 +795,12 @@ mod tests {
         );
         let locs = extract_locators(&html);
         assert_eq!(locs.len(), 2, "one freenet + one https, duplicate removed");
-        assert!(locs.iter().any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
-        assert!(locs.iter().any(|(l, k)| l == "https://a.com/" && *k == "external"));
+        assert!(locs
+            .iter()
+            .any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
+        assert!(locs
+            .iter()
+            .any(|(l, k)| l == "https://a.com/" && *k == "external"));
     }
 
     #[test]
@@ -740,7 +811,10 @@ mod tests {
             None
         );
         assert_eq!(normalize_href(&format!("freenet:{ID}/main.css")), None);
-        assert_eq!(normalize_href(&format!("/v1/contract/web/{ID}/app.wasm")), None);
+        assert_eq!(
+            normalize_href(&format!("/v1/contract/web/{ID}/app.wasm")),
+            None
+        );
         // A real page path is still a site.
         assert_eq!(
             normalize_href(&format!("/v1/contract/web/{ID}/about")),
@@ -761,6 +835,9 @@ mod tests {
             gateway_http_base("ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native"),
             "http://127.0.0.1:7509"
         );
-        assert_eq!(gateway_http_base("wss://gw.example/x"), "https://gw.example");
+        assert_eq!(
+            gateway_http_base("wss://gw.example/x"),
+            "https://gw.example"
+        );
     }
 }

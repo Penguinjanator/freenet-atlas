@@ -135,9 +135,7 @@ impl IndexState {
             match &self.key_auth {
                 None => self.key_auth = Some(ka.clone()),
                 Some(cur) if cur == ka => {}
-                Some(_) => {
-                    return Err("key_auth is immutable in this version".to_string())
-                }
+                Some(_) => return Err("key_auth is immutable in this version".to_string()),
             }
         }
         let ka = self
@@ -322,8 +320,22 @@ mod tests {
         let v2 = signed(RecordBody::Live(entry(&id, 2, "v2")), &online);
         let v1 = signed(RecordBody::Live(entry(&id, 1, "v1")), &online);
         // apply newer then older; older must not win.
-        s.apply_delta(&IndexDelta { key_auth: None, records: vec![v2] }, &p).unwrap();
-        s.apply_delta(&IndexDelta { key_auth: None, records: vec![v1] }, &p).unwrap();
+        s.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![v2],
+            },
+            &p,
+        )
+        .unwrap();
+        s.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![v1],
+            },
+            &p,
+        )
+        .unwrap();
         assert_eq!(s.records.get(&id).unwrap().body.version(), 2);
     }
 
@@ -341,9 +353,23 @@ mod tests {
             }),
             &online,
         );
-        s.apply_delta(&IndexDelta { key_auth: None, records: vec![live] }, &p).unwrap();
+        s.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![live],
+            },
+            &p,
+        )
+        .unwrap();
         assert_eq!(s.live_entries().count(), 1);
-        s.apply_delta(&IndexDelta { key_auth: None, records: vec![tomb] }, &p).unwrap();
+        s.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![tomb],
+            },
+            &p,
+        )
+        .unwrap();
         assert_eq!(s.live_entries().count(), 0);
     }
 
@@ -359,7 +385,13 @@ mod tests {
         }
         let mut s = IndexState::initialized(key_auth(&root, &online, 1));
         let err = s
-            .apply_delta(&IndexDelta { key_auth: None, records: vec![rec] }, &p)
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: None,
+                    records: vec![rec],
+                },
+                &p,
+            )
             .unwrap_err();
         assert!(err.contains("sig"), "expected sig error, got: {err}");
     }
@@ -373,7 +405,13 @@ mod tests {
         let rec = signed(RecordBody::Live(entry(&id, 1, "x")), &rogue);
         let mut s = IndexState::initialized(key_auth(&root, &online, 1));
         let err = s
-            .apply_delta(&IndexDelta { key_auth: None, records: vec![rec] }, &p)
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: None,
+                    records: vec![rec],
+                },
+                &p,
+            )
             .unwrap_err();
         assert!(err.contains("unauthorized"), "got: {err}");
     }
@@ -420,7 +458,10 @@ mod tests {
             }
             s
         };
-        let a = mk(vec![signed(RecordBody::Live(entry(&sid(1), 1, "a1")), &online)]);
+        let a = mk(vec![signed(
+            RecordBody::Live(entry(&sid(1), 1, "a1")),
+            &online,
+        )]);
         let b = mk(vec![
             signed(RecordBody::Live(entry(&sid(1), 2, "a2")), &online), // newer for sid 1
             signed(RecordBody::Live(entry(&sid(2), 1, "b")), &online),

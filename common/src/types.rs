@@ -77,7 +77,13 @@ impl Locator {
                 if !contract_id.chars().all(is_base58_char) {
                     return Err("contract id has non-base58 chars".to_string());
                 }
-                if path.split(['?', '#']).next().unwrap_or(path).split('/').any(|seg| seg == "..") {
+                if path
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(path)
+                    .split('/')
+                    .any(|seg| seg == "..")
+                {
                     return Err("path contains a `..` segment".to_string());
                 }
                 Ok(())
@@ -211,8 +217,7 @@ pub struct KeyAuth {
 
 impl KeyAuth {
     pub fn verify_sig(&self, root_vk: &VerifyingKey) -> Result<(), String> {
-        crate::verify(&self.body, &self.sig, root_vk)
-            .map_err(|e| format!("bad key_auth sig: {e}"))
+        crate::verify(&self.body, &self.sig, root_vk).map_err(|e| format!("bad key_auth sig: {e}"))
     }
 
     pub fn authorizes(&self, key: &VerifyingKey) -> bool {

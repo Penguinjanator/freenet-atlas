@@ -108,7 +108,11 @@ fn App() -> Element {
     let entries: Vec<IndexEntry> = match STATE.read().as_ref() {
         Some(state) => {
             let mut v: Vec<IndexEntry> = state.live_entries().cloned().collect();
-            v.sort_by(|a, b| b.featured.cmp(&a.featured).then(b.added_at.cmp(&a.added_at)));
+            v.sort_by(|a, b| {
+                b.featured
+                    .cmp(&a.featured)
+                    .then(b.added_at.cmp(&a.added_at))
+            });
             v.into_iter().filter(|e| matches_query(e, &q)).collect()
         }
         None => Vec::new(),
@@ -207,10 +211,22 @@ fn set_shell_title(title: &str) {
         doc.set_title(title);
     }
     let msg = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("__freenet_shell__"), &JsValue::TRUE);
-    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("title"));
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("__freenet_shell__"),
+        &JsValue::TRUE,
+    );
+    let _ = js_sys::Reflect::set(
+        &msg,
+        &JsValue::from_str("type"),
+        &JsValue::from_str("title"),
+    );
     let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("title"), &JsValue::from_str(title));
-    let target = window.parent().ok().flatten().unwrap_or_else(|| window.clone());
+    let target = window
+        .parent()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| window.clone());
     let _ = target.post_message(&JsValue::from(msg), "*");
 }
 
