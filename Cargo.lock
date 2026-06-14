@@ -150,6 +150,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-crawler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "atlas-index-contract"
 version = "0.1.0"
 dependencies = [
@@ -2748,6 +2760,7 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
