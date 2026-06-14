@@ -32,6 +32,15 @@ struct Cli {
     /// Path to the atlasctl binary.
     #[arg(long, default_value = "atlasctl")]
     atlasctl: String,
+    /// Node binary used to drive the headless renderer.
+    #[arg(long, default_value = "node")]
+    node_bin: String,
+    /// Path to the render.js headless-render helper. When set, `freenet:` pages
+    /// are rendered in a real browser (so client-side WASM/SPA content and links
+    /// are visible); when unset, they are fetched statically and WASM sites
+    /// appear empty.
+    #[arg(long)]
+    renderer: Option<PathBuf>,
     /// File of candidate https URLs, one per line (# comments).
     #[arg(long)]
     sources: PathBuf,
@@ -136,6 +145,13 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A page's content for analysis: raw HTML (for link extraction and fallback
+/// title/meta scraping) plus the best available visible text (for the LLM).
+struct Page {
+    html: String,
+    text: String,
+}
+
 /// Index one locator (`https://...` or `freenet:<id><path>`): fetch its content,
 /// describe it (LLM or fallback), and add it to the index with the given kind.
 fn index_locator(
@@ -146,29 +162,85 @@ fn index_locator(
     loc: &str,
     kind: &str,
 ) -> Result<()> {
-    let html = fetch_for_describe(client, gw, loc)?;
+    let page = get_page(cli, client, gw, loc)?;
     let desc = match key {
-        Some(k) => describe_llm(client, k, loc, &html).unwrap_or_else(|e| {
+        Some(k) => describe_llm(client, k, loc, &page.text).unwrap_or_else(|e| {
             eprintln!("  llm failed ({e:#}), falling back to title/meta");
-            describe_fallback(loc, &html)
+            describe_fallback(loc, &page.html)
         }),
-        None => describe_fallback(loc, &html),
+        None => describe_fallback(loc, &page.html),
     };
     add_entry(cli, loc, kind, &desc)
 }
 
-/// Fetch a target's HTML for description. `https` targets are SSRF-checked and
-/// fetched directly; `freenet:` targets are fetched from our own local gateway's
-/// web endpoint (loopback to our node — intentional, not an SSRF target).
-fn fetch_for_describe(client: &reqwest::blocking::Client, gw: &str, loc: &str) -> Result<String> {
+/// Get a target's content for analysis. `https` targets are SSRF-checked and
+/// fetched statically. `freenet:` targets are loaded from our own local gateway:
+/// if a renderer is configured we drive a headless browser (so client-side
+/// WASM/SPA content and links render), otherwise we fetch the sandbox HTML
+/// statically (which for a WASM site is just the loader). The local gateway is a
+/// loopback to our own node — intentional, not an SSRF target.
+fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) -> Result<Page> {
     if let Some(rest) = loc.strip_prefix("freenet:") {
         let (id, path) = split_freenet(rest);
+        if let Some(renderer) = &cli.renderer {
+            // Render the gateway "shell" URL (no __sandbox query): the shell
+            // creates the sandboxed app iframe, which the renderer reads back.
+            let path = if path.is_empty() { "/" } else { path };
+            let shell_url = format!("{gw}/v1/contract/web/{id}{path}");
+            match render_page(&cli.node_bin, renderer, &shell_url) {
+                Ok(p) => return Ok(p),
+                Err(e) => {
+                    eprintln!("  render failed ({e:#}), falling back to static fetch");
+                }
+            }
+        }
         let sep = if path.contains('?') { '&' } else { '?' };
-        fetch(client, &format!("{gw}/v1/contract/web/{id}{path}{sep}__sandbox=1"))
+        let html = fetch(client, &format!("{gw}/v1/contract/web/{id}{path}{sep}__sandbox=1"))?;
+        let text = visible_text(&html);
+        Ok(Page { html, text })
     } else {
         ssrf_check(loc)?;
-        fetch(client, loc)
+        let html = fetch(client, loc)?;
+        let text = visible_text(&html);
+        Ok(Page { html, text })
     }
+}
+
+/// Drive the headless render helper for one URL, returning the rendered app
+/// frame's HTML and visible text. The page content is untrusted data.
+fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
+    let out = Command::new(node_bin)
+        .arg(renderer)
+        .arg(url)
+        .output()
+        .with_context(|| format!("running renderer {}", renderer.display()))?;
+    if !out.status.success() {
+        bail!(
+            "renderer exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).with_context(|| "renderer output not json")?;
+    if !v["ok"].as_bool().unwrap_or(false) {
+        bail!(
+            "renderer error: {}",
+            v["error"].as_str().unwrap_or("unknown")
+        );
+    }
+    let html = v["html"].as_str().unwrap_or("").to_string();
+    let text = v["text"].as_str().unwrap_or("").to_string();
+    // Fall back to stripping the rendered HTML if the browser gave no innerText.
+    let text = if text.trim().is_empty() {
+        visible_text(&html)
+    } else {
+        text
+    };
+    if html.trim().is_empty() && text.trim().is_empty() {
+        bail!("renderer returned empty page");
+    }
+    Ok(Page { html, text })
 }
 
 /// Crawl a hub (link-repository) page: fetch it, extract outbound site links, and
@@ -183,15 +255,16 @@ fn crawl_hub(
     seen_path: &Path,
     budget: usize,
 ) -> (usize, usize) {
-    let html = match fetch_for_describe(client, gw, hub) {
-        Ok(h) => h,
+    let page = match get_page(cli, client, gw, hub) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("hub {hub}: fetch failed: {e:#}");
             return (0, 0);
         }
     };
-    let links = extract_locators(&html);
+    let links = extract_locators(&page.html);
     eprintln!("hub {hub}: {} candidate link(s)", links.len());
+    let hub_id = freenet_id(hub);
     let mut attempts = 0;
     let mut added = 0;
     for (loc, kind) in links {
@@ -199,7 +272,12 @@ fn crawl_hub(
             eprintln!("hub {hub}: hit attempt budget {budget}, stopping");
             break;
         }
+        // Skip the hub itself, anything already seen, and links back into the
+        // hub's own contract (in-app navigation, assets) — only outbound sites.
         if loc == hub || seen.contains(&loc) {
+            continue;
+        }
+        if hub_id.is_some() && freenet_id(&loc) == hub_id {
             continue;
         }
         // Mark attempted before describe/add (same cost guard as direct sources):
@@ -247,6 +325,9 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         let id_end = after.find(|c: char| !is_b58(c)).unwrap_or(after.len());
         if matches!(id_end, 43 | 44) {
             let path = after[id_end..].split('?').next().unwrap_or("");
+            if is_asset_path(path) {
+                return None;
+            }
             return Some((format!("freenet:{}{}", &after[..id_end], path), "site"));
         }
         return None;
@@ -255,6 +336,9 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
         if matches!(id_end, 43 | 44) {
             let path = rest[id_end..].split('?').next().unwrap_or("");
+            if is_asset_path(path) {
+                return None;
+            }
             return Some((format!("freenet:{}{}", &rest[..id_end], path), "site"));
         }
         return None;
@@ -263,6 +347,23 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         return Some((href.split('#').next().unwrap_or(href).to_string(), "external"));
     }
     None
+}
+
+/// True if a path points at a static asset (script/style/font/image/etc.) rather
+/// than a browsable page. Such links (e.g. a hub's own JS bundle) are not sites.
+fn is_asset_path(path: &str) -> bool {
+    let p = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
+    const EXT: &[&str] = &[
+        ".js", ".mjs", ".css", ".wasm", ".map", ".json", ".png", ".jpg", ".jpeg",
+        ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ];
+    EXT.iter().any(|e| p.ends_with(e))
+}
+
+/// The contract id of a `freenet:` locator (the part before any `/`, `#` or `?`),
+/// or None for non-freenet locators.
+fn freenet_id(loc: &str) -> Option<&str> {
+    loc.strip_prefix("freenet:").map(|rest| split_freenet(rest).0)
 }
 
 /// Derive the gateway HTTP base (scheme://host:port) from the node WS URL.
@@ -324,8 +425,7 @@ fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn describe_llm(client: &reqwest::blocking::Client, key: &str, url: &str, html: &str) -> Result<Described> {
-    let text = visible_text(html);
+fn describe_llm(client: &reqwest::blocking::Client, key: &str, url: &str, text: &str) -> Result<Described> {
     let system = "You write neutral, factual one-line descriptions of web resources for a \
         directory. No marketing, no hype, no first person, no exclamation. Output STRICT JSON \
         with keys: title (short), snippet (one factual sentence), tags (array of up to 5 \
@@ -561,6 +661,29 @@ mod tests {
         assert_eq!(locs.len(), 2, "one freenet + one https, duplicate removed");
         assert!(locs.iter().any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
         assert!(locs.iter().any(|(l, k)| l == "https://a.com/" && *k == "external"));
+    }
+
+    #[test]
+    fn asset_links_are_skipped() {
+        // A hub's own JS/CSS/wasm bundle is not a site.
+        assert_eq!(
+            normalize_href(&format!("/v1/contract/web/{ID}/assets/delta-ui-abc.js")),
+            None
+        );
+        assert_eq!(normalize_href(&format!("freenet:{ID}/main.css")), None);
+        assert_eq!(normalize_href(&format!("/v1/contract/web/{ID}/app.wasm")), None);
+        // A real page path is still a site.
+        assert_eq!(
+            normalize_href(&format!("/v1/contract/web/{ID}/about")),
+            Some((format!("freenet:{ID}/about"), "site"))
+        );
+    }
+
+    #[test]
+    fn freenet_id_extraction() {
+        assert_eq!(freenet_id(&format!("freenet:{ID}/#a/b/c")), Some(ID));
+        assert_eq!(freenet_id(&format!("freenet:{ID}/x?y=1")), Some(ID));
+        assert_eq!(freenet_id("https://example.com/"), None);
     }
 
     #[test]
