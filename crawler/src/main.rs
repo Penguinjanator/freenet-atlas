@@ -170,6 +170,20 @@ fn index_locator(
     kind: &str,
 ) -> Result<bool> {
     let page = get_page(cli, client, gw, loc)?;
+    index_page(cli, client, key, loc, kind, &page)
+}
+
+/// Describe an already-fetched page and add it to the index, applying the
+/// content-safety gate. Split out from `index_locator` so a hub crawl can index
+/// the hub itself from the page it already rendered (no second fetch).
+fn index_page(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    key: Option<&str>,
+    loc: &str,
+    kind: &str,
+    page: &Page,
+) -> Result<bool> {
     let desc = match key {
         Some(k) => describe_llm(client, k, loc, &page.text).unwrap_or_else(|e| {
             eprintln!("  llm failed ({e:#}), falling back to title/meta");
@@ -284,11 +298,26 @@ fn crawl_hub(
             return (0, 0);
         }
     };
+    let mut attempts = 0;
+    let mut added = 0;
+
+    // A hub (link repository) is itself a resource worth listing, so index it
+    // too — not just the sites it links to. Reuse the page already rendered for
+    // link extraction (no second fetch). Marked-seen so it's indexed once.
+    if !seen.contains(hub) && attempts < budget {
+        attempts += 1;
+        seen.insert(hub.to_string());
+        append_seen(seen_path, hub);
+        match index_page(cli, client, key, hub, "site", &page) {
+            Ok(true) => added += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("hub {hub}: self-index failed: {e:#}"),
+        }
+    }
+
     let links = extract_locators(&page.html);
     eprintln!("hub {hub}: {} candidate link(s)", links.len());
     let hub_id = freenet_id(hub);
-    let mut attempts = 0;
-    let mut added = 0;
     for (loc, kind) in links {
         if attempts >= budget {
             eprintln!("hub {hub}: hit attempt budget {budget}, stopping");
