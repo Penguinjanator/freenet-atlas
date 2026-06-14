@@ -91,6 +91,15 @@ enum Cmd {
         #[arg(long)]
         out_meta: PathBuf,
     },
+    /// Publish (PUT) the web-container that serves the UI to the node.
+    WebappPut {
+        #[arg(long)]
+        wasm: PathBuf,
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        metadata: PathBuf,
+    },
 }
 
 /// Mirrors River's web-container metadata so the generic web-container contract
@@ -138,7 +147,31 @@ async fn main() -> Result<()> {
             version,
             out_meta,
         } => webapp_sign(&dir, archive, *version, out_meta),
+        Cmd::WebappPut {
+            wasm,
+            archive,
+            metadata,
+        } => webapp_put(&cli, &dir, wasm, archive, metadata).await,
     }
+}
+
+async fn webapp_put(cli: &Cli, dir: &Path, wasm: &Path, archive: &Path, metadata: &Path) -> Result<()> {
+    let root = load_key(&dir.join("root.key"))?;
+    let params = root.verifying_key().as_bytes().to_vec();
+    let code = fs::read(wasm).with_context(|| format!("reading {}", wasm.display()))?;
+    let meta = fs::read(metadata).with_context(|| format!("reading {}", metadata.display()))?;
+    let web = fs::read(archive).with_context(|| format!("reading {}", archive.display()))?;
+    // Web-container state layout (River's generic contract):
+    // [metadata_len: u64 BE][metadata][web_len: u64 BE][web]
+    let mut state = Vec::with_capacity(16 + meta.len() + web.len());
+    state.extend_from_slice(&(meta.len() as u64).to_be_bytes());
+    state.extend_from_slice(&meta);
+    state.extend_from_slice(&(web.len() as u64).to_be_bytes());
+    state.extend_from_slice(&web);
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let key = client.put(&code, params, state).await?;
+    println!("web-container published: {}", key.id());
+    Ok(())
 }
 
 fn webapp_params(dir: &Path, wasm: &Path, out_params: &Path) -> Result<()> {

@@ -92,10 +92,20 @@ impl IndexState {
     /// re-authorized), so dropping records against a non-final `key_auth` would
     /// depend on merge order. Rotation is deferred to a post-0.1 design.
     pub fn merge(&mut self, other: &IndexState) {
-        // Adopt key_auth only to initialize from empty; an existing one is
-        // immutable. With a unique root-signed key_auth this is order-independent.
-        if self.key_auth.is_none() {
-            self.key_auth = other.key_auth.clone();
+        // key_auth resolution is deterministic for ALL inputs, so convergence
+        // does not rely on there being exactly one root-signed key_auth. Normally
+        // there is (init runs once); but if the operator ever produced two
+        // distinct root-signed key_auths, keeping the one with the smaller
+        // signature bytes is a commutative+associative min (with None as
+        // identity), so peers still converge instead of splitting. Records signed
+        // only by the losing key_auth then fail the final verify in update_state,
+        // surfacing the mistake rather than silently corrupting.
+        match (&self.key_auth, &other.key_auth) {
+            (None, Some(o)) => self.key_auth = Some(o.clone()),
+            (Some(s), Some(o)) if o.sig.to_bytes() < s.sig.to_bytes() => {
+                self.key_auth = Some(o.clone())
+            }
+            _ => {}
         }
         for (sid, orec) in &other.records {
             let take = self
@@ -505,5 +515,25 @@ mod tests {
                 "tombstone wins at equal version regardless of arrival order"
             );
         }
+    }
+
+    #[test]
+    fn two_keyauths_converge_deterministically() {
+        // Operator-error case: two distinct root-signed key_auths. Even then,
+        // empty->set adoption in merge must be order-independent so peers can't
+        // split-brain.
+        let (root, k1, k2) = (key(), key(), key());
+        let a = IndexState::initialized(key_auth(&root, &k1, 1));
+        let b = IndexState::initialized(key_auth(&root, &k2, 1));
+        let mut left = IndexState::default();
+        left.merge(&a);
+        left.merge(&b);
+        let mut right = IndexState::default();
+        right.merge(&b);
+        right.merge(&a);
+        assert_eq!(
+            left.key_auth, right.key_auth,
+            "key_auth adoption must be order-independent even with two valid key_auths"
+        );
     }
 }
