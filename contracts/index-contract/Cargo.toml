@@ -1,0 +1,14 @@
+[package]
+name = "atlas-index-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atlas single-writer index contract"
+
+[dependencies]
+atlas-common.workspace = true
+ciborium.workspace = true
+freenet-stdlib = { workspace = true, features = ["contract"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
