@@ -18,6 +18,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey};
 use serde::Serialize;
 
 use api::NodeClient;
+use freenet_stdlib::prelude::ContractInstanceId;
 
 const CONTRACT_WASM: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
@@ -105,6 +106,12 @@ enum Cmd {
         #[arg(long)]
         metadata: PathBuf,
     },
+    /// Raw GET of any contract instance id; writes its state bytes to --out.
+    RawGet {
+        instance: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 /// Mirrors River's web-container metadata so the generic web-container contract
@@ -157,7 +164,17 @@ async fn main() -> Result<()> {
             archive,
             metadata,
         } => webapp_put(&cli, &dir, wasm, archive, metadata).await,
+        Cmd::RawGet { instance, out } => raw_get(&cli, instance, out).await,
     }
+}
+
+async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
+    let id: ContractInstanceId = instance.parse().map_err(|e| anyhow!("bad instance id: {e}"))?;
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let bytes = client.get_instance(id).await?;
+    fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    println!("wrote {} bytes to {}", bytes.len(), out.display());
+    Ok(())
 }
 
 async fn webapp_put(cli: &Cli, dir: &Path, wasm: &Path, archive: &Path, metadata: &Path) -> Result<()> {

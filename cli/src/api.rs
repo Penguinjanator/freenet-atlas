@@ -75,6 +75,22 @@ impl NodeClient {
         }
     }
 
+    /// Raw GET of an arbitrary contract instance id (returns its state bytes).
+    pub async fn get_instance(&mut self, id: ContractInstanceId) -> Result<Vec<u8>> {
+        let req = ContractRequest::Get {
+            key: id,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+        match self.roundtrip(ClientRequest::ContractOp(req)).await? {
+            HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
+                Ok(state.as_ref().to_vec())
+            }
+            other => Err(anyhow!("unexpected GET response: {other:?}")),
+        }
+    }
+
     pub async fn get(&mut self, key: &ContractKey, subscribe: bool) -> Result<Vec<u8>> {
         let req = ContractRequest::Get {
             key: *key.id(),
