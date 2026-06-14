@@ -92,43 +92,202 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
         .user_agent("atlas-crawler/0.1")
         .build()?;
 
+    let gw = gateway_http_base(&cli.node);
+    // `attempts` = locators we fetch and may send to the LLM this run. `cli.max`
+    // is a HARD per-run cap on it: the cost ceiling, independent of successes.
+    let mut attempts = 0usize;
     let mut added = 0usize;
     for raw in sources.lines() {
-        let url = raw.trim();
-        if url.is_empty() || url.starts_with('#') {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if seen.contains(url) {
-            continue;
-        }
-        if added >= cli.max {
-            eprintln!("reached --max {}, stopping", cli.max);
+        if attempts >= cli.max {
+            eprintln!("reached --max {} attempts, stopping", cli.max);
             break;
         }
-        match process(cli, &client, key.as_deref(), url) {
-            Ok(()) => {
-                seen.insert(url.to_string());
-                append_seen(seen_path, url);
-                added += 1;
+        // `hub <url>` (or `hub: <url>`): a link repository — index the sites it
+        // links to (ONE level; linked sites are NOT recursively crawled as hubs,
+        // so work is bounded). A plain line is indexed directly.
+        if let Some(hub) = line.strip_prefix("hub ").or_else(|| line.strip_prefix("hub:")) {
+            let hub = hub.trim().to_string();
+            let (a, ok) = crawl_hub(
+                cli, &client, key.as_deref(), &gw, &hub, &mut seen, seen_path, cli.max - attempts,
+            );
+            attempts += a;
+            added += ok;
+        } else {
+            if seen.contains(line) {
+                continue;
             }
-            Err(e) => eprintln!("skip {url}: {e:#}"),
+            // Mark attempted BEFORE describe/add so a failure can't re-describe
+            // (and re-bill) the same locator on every future run: at most one LLM
+            // call per locator, ever. (To retry one, remove it from the seen file.)
+            attempts += 1;
+            seen.insert(line.to_string());
+            append_seen(seen_path, line);
+            match index_locator(cli, &client, key.as_deref(), &gw, line, "external") {
+                Ok(()) => added += 1,
+                Err(e) => eprintln!("skip {line}: {e:#}"),
+            }
         }
     }
-    eprintln!("run complete: {added} new entr{}", if added == 1 { "y" } else { "ies" });
+    eprintln!("run complete: {added} added / {attempts} attempted (cap {})", cli.max);
     Ok(())
 }
 
-fn process(cli: &Cli, client: &reqwest::blocking::Client, key: Option<&str>, url: &str) -> Result<()> {
-    ssrf_check(url)?;
-    let html = fetch(client, url)?;
+/// Index one locator (`https://...` or `freenet:<id><path>`): fetch its content,
+/// describe it (LLM or fallback), and add it to the index with the given kind.
+fn index_locator(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    key: Option<&str>,
+    gw: &str,
+    loc: &str,
+    kind: &str,
+) -> Result<()> {
+    let html = fetch_for_describe(client, gw, loc)?;
     let desc = match key {
-        Some(k) => describe_llm(client, k, url, &html).unwrap_or_else(|e| {
+        Some(k) => describe_llm(client, k, loc, &html).unwrap_or_else(|e| {
             eprintln!("  llm failed ({e:#}), falling back to title/meta");
-            describe_fallback(url, &html)
+            describe_fallback(loc, &html)
         }),
-        None => describe_fallback(url, &html),
+        None => describe_fallback(loc, &html),
     };
-    add_entry(cli, url, &desc)
+    add_entry(cli, loc, kind, &desc)
+}
+
+/// Fetch a target's HTML for description. `https` targets are SSRF-checked and
+/// fetched directly; `freenet:` targets are fetched from our own local gateway's
+/// web endpoint (loopback to our node — intentional, not an SSRF target).
+fn fetch_for_describe(client: &reqwest::blocking::Client, gw: &str, loc: &str) -> Result<String> {
+    if let Some(rest) = loc.strip_prefix("freenet:") {
+        let (id, path) = split_freenet(rest);
+        let sep = if path.contains('?') { '&' } else { '?' };
+        fetch(client, &format!("{gw}/v1/contract/web/{id}{path}{sep}__sandbox=1"))
+    } else {
+        ssrf_check(loc)?;
+        fetch(client, loc)
+    }
+}
+
+/// Crawl a hub (link-repository) page: fetch it, extract outbound site links, and
+/// index each new one (LLM-described). Returns the number added.
+fn crawl_hub(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    key: Option<&str>,
+    gw: &str,
+    hub: &str,
+    seen: &mut HashSet<String>,
+    seen_path: &Path,
+    budget: usize,
+) -> (usize, usize) {
+    let html = match fetch_for_describe(client, gw, hub) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("hub {hub}: fetch failed: {e:#}");
+            return (0, 0);
+        }
+    };
+    let links = extract_locators(&html);
+    eprintln!("hub {hub}: {} candidate link(s)", links.len());
+    let mut attempts = 0;
+    let mut added = 0;
+    for (loc, kind) in links {
+        if attempts >= budget {
+            eprintln!("hub {hub}: hit attempt budget {budget}, stopping");
+            break;
+        }
+        if loc == hub || seen.contains(&loc) {
+            continue;
+        }
+        // Mark attempted before describe/add (same cost guard as direct sources):
+        // each linked locator is described at most once, ever.
+        attempts += 1;
+        seen.insert(loc.clone());
+        append_seen(seen_path, &loc);
+        match index_locator(cli, client, key, gw, &loc, kind) {
+            Ok(()) => added += 1,
+            Err(e) => eprintln!("  skip {loc}: {e:#}"),
+        }
+    }
+    (attempts, added)
+}
+
+/// Extract outbound site locators from hub HTML: `freenet:<id>` links, gateway
+/// `/v1/contract/web/<id>` links (normalized to `freenet:`), and external
+/// `https://` links. Skips relative/in-app/anchor/mailto links; dedups.
+fn extract_locators(html: &str) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut seen = HashSet::new();
+    let lower = html.to_ascii_lowercase(); // ASCII-only change: byte offsets match html
+    let mut i = 0;
+    while let Some(p) = lower[i..].find("href=\"") {
+        let start = i + p + 6;
+        let Some(end_rel) = html[start..].find('"') else { break };
+        let href = decode_entities(html[start..start + end_rel].trim());
+        i = start + end_rel + 1;
+        if let Some((loc, kind)) = normalize_href(&href) {
+            if seen.insert(loc.clone()) {
+                out.push((loc, kind));
+            }
+        }
+    }
+    out
+}
+
+fn normalize_href(href: &str) -> Option<(String, &'static str)> {
+    let is_b58 = |c: char| {
+        matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
+    };
+    // Gateway web URL (absolute or relative path) -> freenet:<id><path>
+    if let Some(pos) = href.find("/v1/contract/web/") {
+        let after = &href[pos + "/v1/contract/web/".len()..];
+        let id_end = after.find(|c: char| !is_b58(c)).unwrap_or(after.len());
+        if matches!(id_end, 43 | 44) {
+            let path = after[id_end..].split('?').next().unwrap_or("");
+            return Some((format!("freenet:{}{}", &after[..id_end], path), "site"));
+        }
+        return None;
+    }
+    if let Some(rest) = href.strip_prefix("freenet:") {
+        let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
+        if matches!(id_end, 43 | 44) {
+            let path = rest[id_end..].split('?').next().unwrap_or("");
+            return Some((format!("freenet:{}{}", &rest[..id_end], path), "site"));
+        }
+        return None;
+    }
+    if href.starts_with("https://") {
+        return Some((href.split('#').next().unwrap_or(href).to_string(), "external"));
+    }
+    None
+}
+
+/// Derive the gateway HTTP base (scheme://host:port) from the node WS URL.
+fn gateway_http_base(node: &str) -> String {
+    let (scheme, rest) = if let Some(r) = node.strip_prefix("wss://") {
+        ("https", r)
+    } else if let Some(r) = node.strip_prefix("ws://") {
+        ("http", r)
+    } else if let Some(r) = node.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = node.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        ("http", node)
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{host}")
+}
+
+fn split_freenet(rest: &str) -> (&str, &str) {
+    let is_b58 = |c: char| {
+        matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
+    };
+    let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
+    (&rest[..id_end], &rest[id_end..])
 }
 
 /// Basic SSRF guard: https only, reject IP literals in private/loopback ranges
@@ -231,25 +390,25 @@ fn describe_fallback(url: &str, html: &str) -> Described {
     }
 }
 
-fn add_entry(cli: &Cli, url: &str, d: &Described) -> Result<()> {
+fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
     let mut cmd = Command::new(&cli.atlasctl);
     cmd.args(["--node", &cli.node]);
     if let Some(kd) = &cli.key_dir {
         cmd.args(["--key-dir", &kd.to_string_lossy()]);
     }
-    cmd.args(["add", "--kind", "external", "--title", &d.title]);
+    cmd.args(["add", "--kind", kind, "--title", &d.title]);
     if !d.snippet.is_empty() {
         cmd.args(["--snippet", &d.snippet]);
     }
     if !d.tags.is_empty() {
         cmd.args(["--tags", &d.tags.join(",")]);
     }
-    cmd.args(["--locator", url]);
+    cmd.args(["--locator", loc]);
     let out = cmd.output().with_context(|| "running atlasctl")?;
     if !out.status.success() {
         bail!("atlasctl add failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    println!("added: {} ({url})", d.title);
+    println!("added: {} ({loc})", d.title);
     Ok(())
 }
 
@@ -354,5 +513,62 @@ fn trim_len(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";
+
+    #[test]
+    fn normalize_href_variants() {
+        assert_eq!(
+            normalize_href(&format!("freenet:{ID}")),
+            Some((format!("freenet:{ID}"), "site"))
+        );
+        assert_eq!(
+            normalize_href(&format!("/v1/contract/web/{ID}/")),
+            Some((format!("freenet:{ID}/"), "site"))
+        );
+        // absolute gateway url, sandbox query dropped
+        assert_eq!(
+            normalize_href(&format!("http://gw.example/v1/contract/web/{ID}/?__sandbox=1")),
+            Some((format!("freenet:{ID}/"), "site"))
+        );
+        // external https, fragment dropped
+        assert_eq!(
+            normalize_href("https://example.com/p#frag"),
+            Some(("https://example.com/p".to_string(), "external"))
+        );
+        // skipped: relative, anchor, mailto, non-tls
+        assert_eq!(normalize_href("/relative"), None);
+        assert_eq!(normalize_href("#x"), None);
+        assert_eq!(normalize_href("mailto:a@b.c"), None);
+        assert_eq!(normalize_href("http://insecure.example"), None);
+        // bad contract id length -> not a freenet locator
+        assert_eq!(normalize_href("freenet:tooShort"), None);
+    }
+
+    #[test]
+    fn extract_locators_dedups_and_skips() {
+        let html = format!(
+            r##"<a href="freenet:{ID}">a</a> <a href="freenet:{ID}">dup</a>
+               <a href="https://a.com/">b</a> <a href="#">skip</a> <a href="/rel">skip</a>"##
+        );
+        let locs = extract_locators(&html);
+        assert_eq!(locs.len(), 2, "one freenet + one https, duplicate removed");
+        assert!(locs.iter().any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
+        assert!(locs.iter().any(|(l, k)| l == "https://a.com/" && *k == "external"));
+    }
+
+    #[test]
+    fn gateway_base_from_ws() {
+        assert_eq!(
+            gateway_http_base("ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native"),
+            "http://127.0.0.1:7509"
+        );
+        assert_eq!(gateway_http_base("wss://gw.example/x"), "https://gw.example");
     }
 }

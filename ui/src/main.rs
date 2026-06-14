@@ -98,7 +98,11 @@ fn App() -> Element {
                 value: "{query}",
                 oninput: move |e| query.set(e.value()),
             }
-            div { class: "status", "{STATUS}" }
+            // Only surface connection status while not yet ready (connecting,
+            // looking for the index, errors); hide it in the normal case.
+            if STATUS.read().as_str() != "ready" {
+                div { class: "status", "{STATUS}" }
+            }
             if entries.is_empty() {
                 div { class: "empty",
                     if STATE.read().is_some() { "Nothing matches." } else { "Loading…" }
