@@ -44,6 +44,7 @@ impl NodeClient {
         code: &[u8],
         params: Vec<u8>,
         state: Vec<u8>,
+        subscribe: bool,
     ) -> Result<ContractKey> {
         let contract_code = ContractCode::from(code.to_vec());
         let parameters = Parameters::from(params);
@@ -56,22 +57,30 @@ impl NodeClient {
             contract: container,
             state: WrappedState::new(state),
             related_contracts: Default::default(),
-            subscribe: false,
-            blocking_subscribe: false,
+            // Subscribe on publish so the node hosts the contract and it's
+            // findable by cross-node GETs (a subscribe:false PUT stores it
+            // locally but lets remote GETs dead-end).
+            subscribe,
+            blocking_subscribe: subscribe,
         };
         match self.roundtrip(ClientRequest::ContractOp(req)).await? {
             HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => Ok(key),
+            // PUT over an existing contract is applied as an update (e.g. a
+            // web-container version bump), which the node acknowledges with an
+            // update notification/response rather than a PutResponse.
+            HostResponse::ContractResponse(ContractResponse::UpdateNotification { .. })
+            | HostResponse::ContractResponse(ContractResponse::UpdateResponse { .. }) => Ok(key),
             HostResponse::Ok => Ok(key),
             other => Err(anyhow!("unexpected PUT response: {other:?}")),
         }
     }
 
-    pub async fn get(&mut self, key: &ContractKey) -> Result<Vec<u8>> {
+    pub async fn get(&mut self, key: &ContractKey, subscribe: bool) -> Result<Vec<u8>> {
         let req = ContractRequest::Get {
             key: *key.id(),
             return_contract_code: false,
-            subscribe: false,
-            blocking_subscribe: false,
+            subscribe,
+            blocking_subscribe: subscribe,
         };
         match self.roundtrip(ClientRequest::ContractOp(req)).await? {
             HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {

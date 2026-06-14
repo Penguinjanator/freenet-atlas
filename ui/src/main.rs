@@ -168,8 +168,17 @@ fn connect() {
             Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { .. })) => {
                 spawn_local(request_index());
             }
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound { .. })) => {
+                // The index may not be hosted on a reachable peer yet (cross-node
+                // propagation). Retry rather than hang on "Loading…".
+                *STATUS.write() = "looking for the index…".to_string();
+                gloo_timers::callback::Timeout::new(4000, || spawn_local(request_index())).forget();
+            }
             Ok(_) => {}
-            Err(e) => *STATUS.write() = format!("error: {e}"),
+            Err(e) => {
+                *STATUS.write() = format!("error: {e}");
+                gloo_timers::callback::Timeout::new(5000, || spawn_local(request_index())).forget();
+            }
         },
         |_e: Error| {},
         || {

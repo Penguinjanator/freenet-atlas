@@ -178,6 +178,7 @@ dependencies = [
  "ciborium",
  "dioxus",
  "freenet-stdlib",
+ "gloo-timers",
  "js-sys",
  "serde",
  "wasm-bindgen",

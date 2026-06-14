@@ -70,7 +70,12 @@ enum Cmd {
         cur_version: u64,
     },
     /// GET and print the index's live entries.
-    Show,
+    Show {
+        /// Subscribe (and blocking-subscribe) so the connected node hosts the
+        /// index, making it findable by cross-node GETs.
+        #[arg(long)]
+        subscribe: bool,
+    },
     /// Print the index contract id (no network).
     Key,
     /// Write the web-container params (root vk) and print its contract id
@@ -134,7 +139,7 @@ async fn main() -> Result<()> {
             subject,
             cur_version,
         } => remove(&cli, &dir, subject, *cur_version).await,
-        Cmd::Show => show(&cli, &dir).await,
+        Cmd::Show { subscribe } => show(&cli, &dir, *subscribe).await,
         Cmd::Key => {
             let params = params_bytes(&dir, &cli.slug)?;
             let key = NodeClient::contract_key(CONTRACT_WASM, &params);
@@ -169,7 +174,7 @@ async fn webapp_put(cli: &Cli, dir: &Path, wasm: &Path, archive: &Path, metadata
     state.extend_from_slice(&(web.len() as u64).to_be_bytes());
     state.extend_from_slice(&web);
     let mut client = NodeClient::connect(&cli.node).await?;
-    let key = client.put(&code, params, state).await?;
+    let key = client.put(&code, params, state, true).await?;
     println!("web-container published: {}", key.id());
     Ok(())
 }
@@ -228,7 +233,7 @@ async fn init(cli: &Cli, dir: &Path) -> Result<()> {
     }
     .to_bytes();
     let mut client = NodeClient::connect(&cli.node).await?;
-    let key = client.put(CONTRACT_WASM, params, state).await?;
+    let key = client.put(CONTRACT_WASM, params, state, true).await?;
     println!("index initialized");
     println!("contract id: {}", key.id());
     Ok(())
@@ -286,11 +291,11 @@ async fn remove(cli: &Cli, dir: &Path, subject: &str, cur_version: u64) -> Resul
     Ok(())
 }
 
-async fn show(cli: &Cli, dir: &Path) -> Result<()> {
+async fn show(cli: &Cli, dir: &Path, subscribe: bool) -> Result<()> {
     let params = params_bytes(dir, &cli.slug)?;
     let key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let mut client = NodeClient::connect(&cli.node).await?;
-    let bytes = client.get(&key).await?;
+    let bytes = client.get(&key, subscribe).await?;
     if bytes.is_empty() {
         println!("(index is empty / not initialized)");
         return Ok(());
