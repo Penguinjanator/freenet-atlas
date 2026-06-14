@@ -29,35 +29,57 @@ thread_local! {
 }
 
 const CSS: &str = r#"
-:root { --bg:#fff; --fg:#1a1a1a; --dim:#6b7280; --line:#e5e7eb; --card:#fafafa; }
+:root { --bg:#fff; --fg:#16181d; --dim:#6b7280; --faint:#9aa1ab;
+  --line:#e7e9ee; --card:#fff; --card-hover:#fafafb; --feat:#f7f7f9; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#0f1115; --fg:#e8e8ea; --dim:#9ca3af; --line:#262a31; --card:#161922; }
+  :root { --bg:#0d0f13; --fg:#e9eaed; --dim:#9aa1ab; --faint:#6b7280;
+    --line:#23272f; --card:#14171d; --card-hover:#181c23; --feat:#171b22; }
 }
 * { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--fg);
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
+  -webkit-font-smoothing:antialiased;
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif; }
-.wrap { max-width:960px; margin:0 auto; padding:2rem 1.25rem; }
-header h1 { margin:0; font-weight:650; letter-spacing:-0.02em; }
-.tag { color:var(--dim); margin:.15rem 0 1.25rem; }
-.search { width:100%; padding:.7rem .9rem; font-size:1rem; color:var(--fg);
-  background:var(--card); border:1px solid var(--line); border-radius:8px; outline:none; }
+.wrap { max-width:980px; margin:0 auto; padding:2.5rem 1.25rem 4rem; }
+.head { display:flex; align-items:baseline; justify-content:space-between; gap:1rem;
+  padding-bottom:1.1rem; border-bottom:1px solid var(--line); margin-bottom:1.5rem; }
+.brand h1 { margin:0; font-size:1.7rem; font-weight:680; letter-spacing:-0.03em; }
+.brand p { margin:.2rem 0 0; color:var(--dim); font-size:.9rem; }
+.count { color:var(--faint); font-size:.78rem; white-space:nowrap;
+  font-variant-numeric:tabular-nums; }
+.search { width:100%; padding:.72rem .95rem; font-size:.98rem; color:var(--fg);
+  background:var(--card); border:1px solid var(--line); border-radius:9px; outline:none;
+  transition:border-color .15s; }
+.search::placeholder { color:var(--faint); }
 .search:focus { border-color:var(--dim); }
-.status { color:var(--dim); font-size:.8rem; margin:.6rem 0 1.25rem; }
-.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:.9rem; }
-.card { border:1px solid var(--line); border-radius:10px; padding:1rem; background:var(--card);
-  display:flex; flex-direction:column; min-height:140px; }
-.card-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:.4rem; }
-.kind { font-size:.65rem; text-transform:uppercase; letter-spacing:.06em; color:var(--dim);
-  border:1px solid var(--line); border-radius:4px; padding:.05rem .35rem; }
-.star { color:var(--dim); }
-.card h3 { margin:.1rem 0 .35rem; font-size:1.02rem; }
-.snip { color:var(--dim); font-size:.88rem; margin:0 0 .6rem; flex:1; }
-.tags { display:flex; flex-wrap:wrap; gap:.3rem; margin-bottom:.7rem; }
-.t { font-size:.68rem; color:var(--dim); border:1px solid var(--line); border-radius:4px; padding:.02rem .3rem; }
-.open { align-self:flex-start; font-size:.82rem; text-decoration:none; color:var(--fg);
-  border:1px solid var(--line); border-radius:6px; padding:.3rem .6rem; }
+.status { color:var(--dim); font-size:.8rem; margin:.7rem 0 0; }
+.results { color:var(--faint); font-size:.76rem; margin:.7rem 0 0;
+  font-variant-numeric:tabular-nums; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(264px,1fr));
+  gap:.85rem; margin-top:1.4rem; }
+.card { position:relative; border:1px solid var(--line); border-radius:11px;
+  padding:1.05rem 1.1rem; background:var(--card); display:flex; flex-direction:column;
+  min-height:152px; transition:border-color .15s, transform .15s, background .15s; }
+.card:hover { border-color:var(--dim); transform:translateY(-2px); background:var(--card-hover); }
+.card.feat { background:var(--feat); }
+.card-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:.55rem; }
+.kind { font-size:.66rem; text-transform:uppercase; letter-spacing:.09em; color:var(--faint);
+  font-weight:600; }
+.star { color:var(--dim); font-size:.82rem; }
+.card h3 { margin:0 0 .4rem; font-size:1.04rem; font-weight:620; letter-spacing:-0.01em;
+  line-height:1.3; }
+.snip { color:var(--dim); font-size:.875rem; line-height:1.45; margin:0 0 .8rem;
+  display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+.tags { display:flex; flex-wrap:wrap; gap:.32rem; margin:0 0 .9rem; }
+.t { font-size:.68rem; color:var(--dim); background:transparent; border:1px solid var(--line);
+  border-radius:5px; padding:.08rem .4rem; }
+.open { margin-top:auto; align-self:flex-start; font-size:.8rem; text-decoration:none;
+  color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:.34rem .65rem;
+  transition:border-color .15s; }
 .open:hover { border-color:var(--dim); }
-.empty { color:var(--dim); padding:2rem 0; }
+.empty { color:var(--dim); padding:3rem 0; text-align:center; }
+.foot { margin-top:2.5rem; padding-top:1.2rem; border-top:1px solid var(--line);
+  color:var(--faint); font-size:.76rem; line-height:1.6; }
 "#;
 
 fn main() {
@@ -76,6 +98,13 @@ fn App() -> Element {
     let mut query = use_signal(String::new);
     let q = query().to_lowercase();
 
+    // Total live entries (unfiltered) for the header count, and the filtered set
+    // shown in the grid.
+    let total = STATE
+        .read()
+        .as_ref()
+        .map(|s| s.live_entries().count())
+        .unwrap_or(0);
     let entries: Vec<IndexEntry> = match STATE.read().as_ref() {
         Some(state) => {
             let mut v: Vec<IndexEntry> = state.live_entries().cloned().collect();
@@ -84,13 +113,20 @@ fn App() -> Element {
         }
         None => Vec::new(),
     };
+    let searching = !q.is_empty();
+    let shown = entries.len();
 
     rsx! {
         style { dangerous_inner_html: CSS }
         div { class: "wrap",
-            header {
-                h1 { "Atlas" }
-                p { class: "tag", "Discover Freenet" }
+            div { class: "head",
+                div { class: "brand",
+                    h1 { "Atlas" }
+                    p { "Discover Freenet" }
+                }
+                if total > 0 {
+                    div { class: "count", "{total} entries" }
+                }
             }
             input {
                 class: "search",
@@ -103,6 +139,11 @@ fn App() -> Element {
             if STATUS.read().as_str() != "ready" {
                 div { class: "status", "{STATUS}" }
             }
+            if searching && STATE.read().is_some() {
+                div { class: "results",
+                    if shown == 1 { "1 result" } else { "{shown} results" }
+                }
+            }
             if entries.is_empty() {
                 div { class: "empty",
                     if STATE.read().is_some() { "Nothing matches." } else { "Loading…" }
@@ -114,6 +155,9 @@ fn App() -> Element {
                     }
                 }
             }
+            footer { class: "foot",
+                "Atlas lists what it finds on Freenet. A listing is not an endorsement; open links at your own discretion."
+            }
         }
     }
 }
@@ -122,8 +166,9 @@ fn App() -> Element {
 fn EntryCard(entry: IndexEntry) -> Element {
     let external = matches!(entry.locator, Locator::External { .. });
     let href = open_href(&entry.locator);
+    let card_class = if entry.featured { "card feat" } else { "card" };
     rsx! {
-        div { class: "card",
+        div { class: "{card_class}",
             div { class: "card-top",
                 span { class: "kind", "{kind_label(entry.kind)}" }
                 if entry.featured {
