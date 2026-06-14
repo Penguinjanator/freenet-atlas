@@ -1,0 +1,23 @@
+[package]
+name = "atlas-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atlas Discover UI (Dioxus web app, served as a Freenet web-container)"
+
+[dependencies]
+atlas-common.workspace = true
+dioxus = { version = "0.7.3", features = ["web"] }
+freenet-stdlib = { workspace = true, features = ["net"] }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "WebSocket",
+    "Storage",
+    "console",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+ciborium.workspace = true
+serde.workspace = true

@@ -1,0 +1,16 @@
+[application]
+name = "atlas"
+default_platform = "web"
+
+[web.app]
+title = "Atlas"
+
+# When served from a Freenet web-container the app lives under
+# /v1/contract/web/<id>/, so the asset base path must be set at build time.
+# The deploy step (cargo make / build script) uncomments and fills this in with
+# the published web-container id before `dx build`.
+# base_path = "v1/contract/web/REPLACED_AT_DEPLOY"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src"]

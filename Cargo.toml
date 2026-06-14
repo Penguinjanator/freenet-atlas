@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["common", "contracts/index-contract", "cli"]
+members = ["common", "contracts/index-contract", "cli", "ui"]
 
 [workspace.package]
 version = "0.1.0"
