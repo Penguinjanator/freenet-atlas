@@ -319,7 +319,21 @@ fn ws_url() -> Option<String> {
 fn open_href(loc: &Locator) -> String {
     match loc {
         Locator::Freenet { contract_id, path } => {
-            format!("/v1/contract/web/{contract_id}{path}")
+            // The contract-web root needs a trailing slash after the id. A
+            // locator whose path is empty (`freenet:<id>`) or begins with a
+            // query/fragment (`freenet:<id>#frag`) would otherwise produce a
+            // slash-less URL. The gateway tolerates that on a direct top-level
+            // load (308 redirect to the slash form), but when the link is
+            // clicked inside our sandboxed iframe the parent shell's
+            // cross-contract nav handler validates the path against
+            // CONTRACT_PREFIX_RE (`/v1/contract/web/<id>/`), which *requires*
+            // the trailing slash — so the click is silently dropped. Ensure
+            // there is always a `/` between the id and the suffix.
+            if path.starts_with('/') {
+                format!("/v1/contract/web/{contract_id}{path}")
+            } else {
+                format!("/v1/contract/web/{contract_id}/{path}")
+            }
         }
         Locator::External { url } => url.clone(),
     }
