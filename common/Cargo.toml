@@ -1,0 +1,25 @@
+[package]
+name = "atlas-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types for the Atlas discovery layer on Freenet"
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+bs58.workspace = true
+# Only pulled in when the `rng` feature is enabled (native crates). Keeping it
+# optional keeps the contract build free of getrandom/wasm-bindgen placeholders.
+rand = { workspace = true, optional = true }
+
+[features]
+default = []
+# Key generation and random subject-id minting. Native-only (cli, crawler).
+rng = ["dep:rand", "ed25519-dalek/rand_core"]
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

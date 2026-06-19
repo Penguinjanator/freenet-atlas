@@ -1,0 +1,23 @@
+[package]
+name = "atlasctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atlas curator CLI: manage the index contract on a Freenet node"
+
+[[bin]]
+name = "atlasctl"
+path = "src/main.rs"
+
+[dependencies]
+atlas-common = { workspace = true, features = ["rng"] }
+ciborium.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+freenet-stdlib = { workspace = true, features = ["net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+anyhow = "1"
+serde.workspace = true
+clap = { version = "4", features = ["derive"] }
+bs58.workspace = true
+rand.workspace = true

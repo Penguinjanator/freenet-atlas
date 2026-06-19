@@ -1,0 +1,16 @@
+[application]
+name = "atlas"
+default_platform = "web"
+
+[web.app]
+title = "Atlas"
+
+# Served from a Freenet web-container under /v1/contract/web/<id>/, so asset URLs
+# must be rooted there. This is the Atlas web-container id derived from
+# (web_container_contract.wasm, root_vk). Note: this breaks plain `dx serve`
+# (assets resolve under this path, not the dev-server root) - it's a deploy build.
+base_path = "v1/contract/web/771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src"]
