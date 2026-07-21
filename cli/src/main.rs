@@ -3,6 +3,7 @@
 //! signed by the online key and merged into the index by per-subject version.
 
 mod api;
+mod migration;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,6 +79,22 @@ enum Cmd {
     },
     /// Print the index contract id (no network).
     Key,
+    /// Print the current index id plus every legacy (pre-rebuild) id, so a
+    /// curator can see exactly which addresses a migration spans (no network).
+    Keys,
+    /// Carry the curated index forward after a rebuild re-keyed it: GET EVERY
+    /// legacy (pre-rebuild) generation and PUT-merge each non-empty state into
+    /// the current address (subscribing so the node hosts it). The contract
+    /// merges per-subject by version (tombstone-aware), so merging all
+    /// generations is idempotent and order-independent — re-running, or a
+    /// generation holding only tombstones, never resurrects a deleted subject. A
+    /// legacy GET that errors (dead-end / timeout) aborts rather than being
+    /// treated as an empty state.
+    Migrate {
+        /// Probe/GET only; report what WOULD be carried forward without PUTting.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Write the web-container params (root vk) and print its contract id
     /// (needed for the UI base_path). Reuses the root key as the UI owner.
     WebappParams {
@@ -159,6 +176,16 @@ async fn main() -> Result<()> {
             println!("{}", key.id());
             Ok(())
         }
+        Cmd::Keys => {
+            let params = params_bytes(&dir, &cli.slug)?;
+            let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+            println!("current: {}", key.id());
+            for (i, k) in migration::legacy_index_keys(&params).iter().enumerate() {
+                println!("legacy[{i}]: {}", k.id());
+            }
+            Ok(())
+        }
+        Cmd::Migrate { dry_run } => migrate(&cli, &dir, *dry_run).await,
         Cmd::WebappParams { wasm, out_params } => webapp_params(&dir, wasm, out_params),
         Cmd::WebappSign {
             archive,
@@ -201,16 +228,170 @@ async fn push_state(dir: &Path, slug: &str, from: &str, to: &str) -> Result<()> 
     Ok(())
 }
 
-/// Decode an index state and count live (non-tombstoned) entries; 0 if empty or
-/// undecodable (best-effort, for logging only).
-fn count_live(state: &[u8]) -> usize {
+/// Carry the curated index forward after a rebuild re-keyed the contract.
+///
+/// The index address is `hash(wasm, params)`; a stdlib/toolchain bump that
+/// changes the WASM moves it. This GETs EVERY legacy (pre-rebuild) address and
+/// PUT-merges each non-empty state into the current address, so no generation's
+/// entries are stranded. The contract merges per-subject by version
+/// (tombstone-aware), so merging all generations is idempotent and order-
+/// independent — re-running is safe, and a tombstone-only generation still
+/// contributes its takedowns without resurrecting anything.
+///
+/// A legacy GET that *errors* (a dead-ended / timed-out cross-node probe) is NOT
+/// treated as an empty state: it aborts, so the operator never rebuilds the UI
+/// onto an empty index while entries still live at the old address.
+async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
+    let params = params_bytes(dir, &cli.slug)?;
+    let current_key = NodeClient::contract_key(CONTRACT_WASM, &params);
+    let legacy_keys = migration::legacy_index_keys(&params);
+    if legacy_keys.is_empty() {
+        bail!("no legacy code hashes registered — nothing to migrate from");
+    }
+    println!("current index: {}", current_key.id());
+
+    let mut client = NodeClient::connect(&cli.node).await?;
+
+    // Carry EVERY legacy generation forward, not just the "biggest" one. The
+    // contract merges per-subject by version (tombstone-aware), so PUT-merging
+    // all of them is idempotent and order-independent: a generation holding only
+    // tombstones still contributes its takedowns, and a stale generation cannot
+    // resurrect a subject a newer one deleted. No count-based selection or
+    // early-return — every non-empty generation participates.
+    let mut merged = 0usize;
+    let mut probe_errors = 0usize;
+    for (i, key) in legacy_keys.iter().enumerate() {
+        // M1: a GET *error* (dead-ended / timed-out cross-node probe) must NEVER
+        // be silently treated as an empty state — otherwise a rebuild would land
+        // on an empty index while the entries still live at the old address. On a
+        // real run we abort immediately (the operator fixes connectivity and
+        // re-runs; the merge is idempotent). In a dry-run we instead warn and keep
+        // surveying the remaining generations, then exit non-zero at the end, so
+        // the operator sees the full picture rather than only the first failure.
+        let plan = match plan_generation(client.get(key, false).await) {
+            Ok(plan) => plan,
+            Err(e) if dry_run => {
+                eprintln!(
+                    "legacy[{i}] {} GET FAILED (reported, NOT counted as empty): {e:#}",
+                    key.id()
+                );
+                probe_errors += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "legacy[{i}] {} GET failed — aborting so its entries are \
+                         not silently dropped as empty",
+                        key.id()
+                    )
+                });
+            }
+        };
+        match plan {
+            None => println!(
+                "legacy[{i}] {} is empty — nothing to carry forward",
+                key.id()
+            ),
+            Some((state, live, tomb)) => {
+                println!(
+                    "legacy[{i}] {} holds {live} live / {tomb} tombstone record(s)",
+                    key.id()
+                );
+                if dry_run {
+                    println!(
+                        "  [dry-run] would PUT-merge legacy[{i}] into {}",
+                        current_key.id()
+                    );
+                } else {
+                    // PUT-over the current contract; the node applies it as a
+                    // merging update and, with subscribe, hosts it so cross-node
+                    // GETs can find it.
+                    client
+                        .put(CONTRACT_WASM, params.clone(), state, true)
+                        .await
+                        .with_context(|| {
+                            format!("PUT-merging legacy[{i}] into the current index")
+                        })?;
+                    merged += 1;
+                    println!("  merged legacy[{i}] into {}", current_key.id());
+                }
+            }
+        }
+    }
+
+    if dry_run {
+        if probe_errors > 0 {
+            bail!(
+                "[dry-run] {probe_errors} legacy generation(s) were unreachable — a \
+                 real migrate would abort on these; fix connectivity and retry so \
+                 their entries are not left stranded"
+            );
+        }
+        println!("[dry-run] complete — no state written");
+        return Ok(());
+    }
+
+    // Read the current index back to confirm what it now serves. This is
+    // informational only (the PUTs above already succeeded), so a failed readback
+    // is a warning, not an abort.
+    match client.get(&current_key, false).await {
+        Ok(after) => println!(
+            "current index {} now holds {} live entries",
+            current_key.id(),
+            count_live(&after)
+        ),
+        Err(e) => eprintln!("warning: could not read the current index back: {e:#}"),
+    }
+    if merged == 0 {
+        println!("no legacy generation held any state — nothing was carried forward");
+    }
+    Ok(())
+}
+
+/// Decide what to do with one legacy generation, given the *outcome* of its GET.
+///
+/// This is the M1 seam: a GET **error** stays an `Err` here — it is NEVER folded
+/// into "empty" — so the caller can abort (real run) or warn-and-continue
+/// (dry-run) instead of silently skipping. Only a *successful* GET is classified:
+/// `Ok(None)` means the address is genuinely empty (skip); `Ok(Some((state, live,
+/// tomb)))` means carry the state forward (any non-empty state, including a
+/// tombstone-only one, so takedowns still propagate).
+fn plan_generation(get_result: Result<Vec<u8>>) -> Result<Option<(Vec<u8>, usize, usize)>> {
+    let state = get_result?;
     if state.is_empty() {
-        return 0;
+        return Ok(None);
+    }
+    let (live, tomb) = count_records(&state);
+    Ok(Some((state, live, tomb)))
+}
+
+/// Decode an index state and count its (live, tombstone) records; (0, 0) if empty
+/// or undecodable (best-effort, for logging only).
+fn count_records(state: &[u8]) -> (usize, usize) {
+    if state.is_empty() {
+        return (0, 0);
     }
     match ciborium::de::from_reader::<IndexState, &[u8]>(state) {
-        Ok(st) => st.live_entries().count(),
-        Err(_) => 0,
+        Ok(st) => {
+            let mut live = 0;
+            let mut tomb = 0;
+            for rec in st.records.values() {
+                match rec.body {
+                    RecordBody::Live(_) => live += 1,
+                    RecordBody::Tomb(_) => tomb += 1,
+                }
+            }
+            (live, tomb)
+        }
+        Err(_) => (0, 0),
     }
+}
+
+/// Count live (non-tombstoned) entries only. Used by `push_state` and the
+/// migrate readback.
+fn count_live(state: &[u8]) -> usize {
+    count_records(state).0
 }
 
 async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
@@ -376,7 +557,7 @@ async fn show(cli: &Cli, dir: &Path, subscribe: bool) -> Result<()> {
     let state: IndexState =
         ciborium::de::from_reader(&bytes[..]).context("decoding index state")?;
     let mut entries: Vec<_> = state.live_entries().collect();
-    entries.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.added_at));
     println!("{} live entries:", entries.len());
     for e in entries {
         let star = if e.featured { "★ " } else { "  " };
@@ -492,4 +673,101 @@ fn now_secs() -> u64 {
 
 fn b58(bytes: &[u8]) -> String {
     bs58::encode(bytes).into_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atlas_common::{IndexEntry, Kind, Locator};
+
+    fn live_record(sid: SubjectId) -> SignedRecord {
+        let key = generate_key();
+        let body = RecordBody::Live(IndexEntry {
+            subject_id: sid,
+            version: 1,
+            kind: Kind::App,
+            title: "t".to_string(),
+            snippet: String::new(),
+            tags: vec![],
+            locator: Locator::External {
+                url: "https://example.com".to_string(),
+            },
+            featured: false,
+            added_at: 0,
+        });
+        SignedRecord {
+            sig: sign(&body, &key),
+            by: key.verifying_key(),
+            body,
+        }
+    }
+
+    fn tomb_record(sid: SubjectId) -> SignedRecord {
+        let key = generate_key();
+        let body = RecordBody::Tomb(Tombstone {
+            subject_id: sid,
+            version: 2,
+        });
+        SignedRecord {
+            sig: sign(&body, &key),
+            by: key.verifying_key(),
+            body,
+        }
+    }
+
+    /// CBOR-encode a state holding the given records (key_auth omitted — this only
+    /// exercises record counting/classification, not signature verification).
+    fn encoded_state(records: Vec<SignedRecord>) -> Vec<u8> {
+        let mut st = IndexState::default();
+        for r in records {
+            st.records.insert(r.body.subject_id().clone(), r);
+        }
+        encode(&st).unwrap()
+    }
+
+    #[test]
+    fn count_records_distinguishes_live_and_tombstone() {
+        let bytes = encoded_state(vec![
+            live_record(SubjectId::random()),
+            live_record(SubjectId::random()),
+            tomb_record(SubjectId::random()),
+        ]);
+        assert_eq!(count_records(&bytes), (2, 1));
+    }
+
+    #[test]
+    fn count_records_empty_bytes_is_zero() {
+        assert_eq!(count_records(&[]), (0, 0));
+    }
+
+    /// M1: a legacy GET *error* must surface as an `Err` (which the caller turns
+    /// into a real-run abort or a dry-run warning), never be folded into an empty
+    /// state — which would let a rebuild land on an empty index while entries
+    /// still live at the old address.
+    #[test]
+    fn plan_generation_surfaces_get_error() {
+        let outcome: Result<Vec<u8>> = Err(anyhow!("simulated dead-end / timeout"));
+        assert!(
+            plan_generation(outcome).is_err(),
+            "a GET error must stay an Err, not be skipped as empty"
+        );
+    }
+
+    /// A *successful* but empty GET is a legitimate skip: nothing lives at that
+    /// address, so there is nothing to carry forward.
+    #[test]
+    fn plan_generation_skips_ok_empty() {
+        assert!(plan_generation(Ok(Vec::new())).unwrap().is_none());
+    }
+
+    /// A tombstone-only generation is non-empty and must still be carried forward
+    /// so its takedowns propagate into the current index.
+    #[test]
+    fn plan_generation_merges_tombstone_only() {
+        let bytes = encoded_state(vec![tomb_record(SubjectId::random())]);
+        let (_, live, tomb) = plan_generation(Ok(bytes))
+            .unwrap()
+            .expect("a tombstone-only generation must be carried forward, not skipped");
+        assert_eq!((live, tomb), (0, 1));
+    }
 }
