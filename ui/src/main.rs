@@ -14,12 +14,39 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
-/// The index contract instance id. Baked in at build time; overridable so the
-/// same UI can target a test index. Default is the local-dev index.
-const INDEX_ID: &str = match option_env!("ATLAS_INDEX_ID") {
-    Some(s) => s,
-    None => "CJUR37WSMxV7C1yhrr3xSgjnrJT5yuvQGFNcgvSnsvg",
-};
+/// The index contract instance id, baked in at build time. REQUIRED: there is
+/// deliberately no default.
+///
+/// A default is what froze the live site. The index re-keys on any `common/`
+/// change, and `atlasctl` derives its target from the committed WASM, so after a
+/// re-key the curator writes to the new address while a UI built with a stale
+/// default keeps reading the old one. The result is not an error the operator
+/// notices: the site renders the pre-re-key snapshot indefinitely and simply
+/// never shows anything new. That happened at the stdlib-0.8.3 bump and left the
+/// published UI six entries behind for over a week.
+///
+/// `env!` turns forgetting it into a build failure instead. Get the value from
+/// `atlasctl key`.
+const INDEX_ID: &str = env!(
+    "ATLAS_INDEX_ID",
+    "ATLAS_INDEX_ID must be set when building the Atlas UI — run `atlasctl key` \
+     to get the current index contract id. A stale or defaulted value silently \
+     freezes the published site at an old index generation."
+);
+
+/// `env!` is satisfied by an EMPTY value, which is exactly what
+/// `ATLAS_INDEX_ID=$(atlasctl key)` produces when `atlasctl` fails (command
+/// substitution discards the exit status). The build would succeed and the site
+/// would show "bad index id" forever, which is the same silent-failure shape this
+/// constant exists to prevent. Check the shape at compile time.
+/// Range, not exactly 43-or-44: a uniformly random 32-byte value base58-encodes to
+/// 44 chars ~94% of the time and 43 chars ~5.7%, but ~0.1% of legitimate ids are
+/// SHORTER, and hard-failing the build on one of those would blame the operator for
+/// a valid id. The point is to catch empty or obviously-truncated values.
+const _: () = assert!(
+    INDEX_ID.len() >= 40 && INDEX_ID.len() <= 44,
+    "ATLAS_INDEX_ID must be a base58 contract instance id (40-44 chars); an empty value usually means the command substitution supplying it failed"
+);
 
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);
 static STATUS: GlobalSignal<String> = Signal::global(|| "connecting…".to_string());
@@ -65,6 +92,8 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
 .card-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:.55rem; }
 .kind { font-size:.66rem; text-transform:uppercase; letter-spacing:.09em; color:var(--faint);
   font-weight:600; }
+.card-top .kind.app { color:var(--dim); text-transform:none; letter-spacing:0; margin-left:.45rem;
+  margin-right:auto; }
 .star { color:var(--dim); font-size:.82rem; }
 .card h3 { margin:0 0 .4rem; font-size:1.04rem; font-weight:620; letter-spacing:-0.01em;
   line-height:1.3; }
@@ -77,6 +106,7 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
   color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:.34rem .65rem;
   transition:border-color .15s; }
 .open:hover { border-color:var(--dim); }
+.open.unavail { color:var(--faint); border-style:dashed; cursor:default; }
 .empty { color:var(--dim); padding:3rem 0; text-align:center; }
 .foot { margin-top:2.5rem; padding-top:1.2rem; border-top:1px solid var(--line);
   color:var(--faint); font-size:.76rem; line-height:1.6; }
@@ -169,12 +199,38 @@ fn App() -> Element {
 #[component]
 fn EntryCard(entry: IndexEntry) -> Element {
     let external = matches!(entry.locator, Locator::External { .. });
-    let href = open_href(&entry.locator);
+    // Resolution goes through the state's app registry, so an app-hosted entry
+    // follows the app's CURRENT address. `None` means the registry does not know
+    // the app (yet), which is a curator gap rather than a broken entry: render
+    // the card without an Open link instead of emitting a href that 404s.
+    let href = STATE
+        .read()
+        .as_ref()
+        .and_then(|s| s.resolve_href(&entry.locator));
+    // The app name is the useful label for an app-hosted resource: "delta site"
+    // says far more than "site", and without it every Delta site in the index
+    // looks identical to every other.
+    let host_app = match &entry.locator {
+        Locator::AppResource { app, .. } => STATE
+            .read()
+            .as_ref()
+            .and_then(|s| {
+                s.apps
+                    .as_ref()
+                    .and_then(|r| r.get(app))
+                    .map(|a| a.name.clone())
+            })
+            .or_else(|| Some(app.clone())),
+        _ => None,
+    };
     let card_class = if entry.featured { "card feat" } else { "card" };
     rsx! {
         div { class: "{card_class}",
             div { class: "card-top",
                 span { class: "kind", "{kind_label(entry.kind)}" }
+                if let Some(app) = host_app {
+                    span { class: "kind app", "on {app}" }
+                }
                 if entry.featured {
                     span { class: "star", "★" }
                 }
@@ -188,11 +244,20 @@ fn EntryCard(entry: IndexEntry) -> Element {
                     }
                 }
             }
-            a {
-                class: "open",
-                href: "{href}",
-                target: if external { "_blank" } else { "_self" },
-                "Open ↗"
+            match href {
+                Some(h) => rsx! {
+                    a {
+                        class: "open",
+                        href: "{h}",
+                        target: if external { "_blank" } else { "_self" },
+                        "Open ↗"
+                    }
+                },
+                None => rsx! {
+                    span { class: "open unavail", title: "This app is not in the registry yet",
+                        "Unavailable"
+                    }
+                },
             }
         }
     }
@@ -314,29 +379,6 @@ fn ws_url() -> Option<String> {
         }
     }
     Some(url)
-}
-
-fn open_href(loc: &Locator) -> String {
-    match loc {
-        Locator::Freenet { contract_id, path } => {
-            // The contract-web root needs a trailing slash after the id. A
-            // locator whose path is empty (`freenet:<id>`) or begins with a
-            // query/fragment (`freenet:<id>#frag`) would otherwise produce a
-            // slash-less URL. The gateway tolerates that on a direct top-level
-            // load (308 redirect to the slash form), but when the link is
-            // clicked inside our sandboxed iframe the parent shell's
-            // cross-contract nav handler validates the path against
-            // CONTRACT_PREFIX_RE (`/v1/contract/web/<id>/`), which *requires*
-            // the trailing slash — so the click is silently dropped. Ensure
-            // there is always a `/` between the id and the suffix.
-            if path.starts_with('/') {
-                format!("/v1/contract/web/{contract_id}{path}")
-            } else {
-                format!("/v1/contract/web/{contract_id}/{path}")
-            }
-        }
-        Locator::External { url } => url.clone(),
-    }
 }
 
 fn kind_label(kind: Kind) -> &'static str {

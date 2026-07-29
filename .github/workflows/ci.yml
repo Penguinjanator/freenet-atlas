@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action: rust-toolchain.toml pins the channel, components and
+      # the wasm target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and the
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # The contract and the UI target wasm32 and are covered by their own jobs;
+      # linting them for the host target would fail on wasm-only deps.
+      - name: cargo clippy (native crates)
+        run: cargo clippy --locked --workspace --exclude atlas-ui --exclude atlas-index-contract --all-targets
+
+      - name: cargo test (native crates)
+        run: cargo test --locked --workspace --exclude atlas-ui --exclude atlas-index-contract
+
+  wasm:
+    name: wasm builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action: rust-toolchain.toml pins the channel, components and
+      # the wasm target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and the
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: contract clippy
+        run: cargo clippy --locked -p atlas-index-contract --target wasm32-unknown-unknown
+
+      # ATLAS_INDEX_ID has no default by design (a stale default silently froze
+      # the published site once). A placeholder is fine here: this job checks that
+      # the UI compiles, and the real value is supplied at publish time.
+      - name: ui check
+        env:
+          # Obviously-fake placeholder of the right shape. Deliberately NOT a real
+          # index id: the previous value here was the retired 0.6.0 address, i.e.
+          # exactly the stale id that froze the live site, which invites a copy-paste.
+          ATLAS_INDEX_ID: PLACEHOLDERnotARealIndexId111111111111111111
+        run: cargo check --locked -p atlas-ui --target wasm32-unknown-unknown
+
+  contract-key:
+    name: committed contract WASM is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action: rust-toolchain.toml pins the channel, components and
+      # the wasm target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and the
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      # The index's on-network address is hash(compiled_wasm, params), and
+      # cli/build.rs embeds the COMMITTED wasm. If a source change under common/
+      # or contracts/ lands without refreshing that artifact, atlasctl silently
+      # targets the OLD address while the deployed contract is the new one (or
+      # vice versa). This job rebuilds and diffs, so the re-key is visible in the
+      # PR rather than discovered after a publish.
+      #
+      # This IS a cross-machine byte-reproducibility assertion: it compares an
+      # artifact built on a contributor's machine against a rebuild on the runner.
+      # So a red diff here means EITHER a stale committed artifact OR a genuine
+      # reproducibility break (toolchain drift, an unremapped path leaking in).
+      # Check `rustup show` and the RUSTFLAGS below before assuming staleness.
+      #
+      # RUSTFLAGS is cleared: build-wasm.sh appends `${RUSTFLAGS:-}` to its own
+      # remap flags, so the workflow-level `-D warnings` would reach this build
+      # and not a local one. Lint level does not affect codegen today, but the
+      # whole point of this job is byte identity, and the next flag someone adds
+      # to that env block might.
+      # Delete it first, so a build that fails to write the artifact shows up as a
+      # deletion in the diff below rather than as a silently-passing no-op if the
+      # script's output path ever drifts from the path being compared.
+      - name: rebuild contract wasm
+        env:
+          RUSTFLAGS: ""
+        run: |
+          rm -f contracts/index-contract/atlas_index_contract.wasm
+          contracts/index-contract/build-wasm.sh
+
+      - name: committed artifact matches source
+        run: |
+          if ! git diff --quiet -- contracts/index-contract/atlas_index_contract.wasm; then
+            echo "::error::The committed contract WASM does not match this source tree."
+            echo "Run contracts/index-contract/build-wasm.sh and commit the result."
+            echo "NOTE: if the hash changed, the index RE-KEYS. Prepend the outgoing"
+            echo "code hash to LEGACY_INDEX_CODE_HASHES in cli/src/migration.rs and plan"
+            echo "an 'atlasctl migrate' before publishing."
+            git diff --stat -- contracts/index-contract/atlas_index_contract.wasm
+            exit 1
+          fi
+          echo "committed WASM matches source"
+
+      # The stale-artifact check above does NOT catch the other half of the
+      # hazard: a `common/` change that legitimately re-keys the contract but
+      # never registers the OUTGOING generation. That passes every other check
+      # (the artifact matches source, the registered hashes still match their
+      # preserved WASMs) and silently orphans the curated index at the old
+      # address. So: if the artifact changed versus the merge base, the migration
+      # registry and a preserved WASM must change in the same diff.
+      # PR-only: a direct push to main that re-keys bypasses this. That is
+      # acceptable only while branch protection requires PRs — if it ever does not,
+      # this needs a push-triggered form comparing against the previous commit.
+      - name: a re-key must register the outgoing generation
+        if: github.event_name == 'pull_request'
+        run: |
+          # Explicit refspec: with a narrow fetch refspec (which some checkout
+          # configurations install) `git fetch origin <branch>` does NOT create
+          # refs/remotes/origin/<branch>, and `git rev-parse origin/<branch>` then
+          # fails — which would red every PR with a message about the WASM having
+          # changed. Name the destination ref so it exists either way.
+          base="origin/${{ github.base_ref }}"
+          git fetch --depth=1 origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          wasm=contracts/index-contract/atlas_index_contract.wasm
+          if git diff --quiet "$base" HEAD -- "$wasm"; then
+            echo "contract WASM unchanged versus $base — no re-key, nothing to register"
+            exit 0
+          fi
+          echo "contract WASM CHANGED versus $base: the index re-keys."
+          ok=1
+          git diff --name-only "$base" HEAD -- cli/src/migration.rs | grep -q . \
+            || { echo "::error::contract WASM changed but cli/src/migration.rs was not updated — prepend the OUTGOING code hash to LEGACY_INDEX_CODE_HASHES"; ok=0; }
+          # Byte-compare, rather than merely requiring that SOME legacy file was
+          # added: the point is that the OUTGOING generation specifically was
+          # preserved. Chained with the unit test
+          # `every_registered_hash_matches_its_preserved_wasm` (preserved bytes ->
+          # registered hash), this closes wasm-identity -> hash-correctness with no
+          # gap in between.
+          git show "$base:$wasm" > /tmp/outgoing.wasm
+          found=0
+          for f in $(git diff --name-only --diff-filter=A "$base" HEAD -- 'contracts/index-contract/legacy/*.wasm'); do
+            if git show "HEAD:$f" | cmp -s - /tmp/outgoing.wasm; then found=1; echo "preserved outgoing WASM as $f"; fi
+          done
+          [ "$found" = 1 ] \
+            || { echo "::error::no added contracts/index-contract/legacy/*.wasm is byte-identical to the OUTGOING contract WASM — preserve the generation being retired"; ok=0; }
+          if [ "$ok" != 1 ]; then exit 1; fi
+          echo "re-key ritual present"

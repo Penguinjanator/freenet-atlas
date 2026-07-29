@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
@@ -92,15 +92,59 @@ impl NodeClient {
     }
 
     pub async fn get(&mut self, key: &ContractKey, subscribe: bool) -> Result<Vec<u8>> {
+        match self.get_optional(key, subscribe).await? {
+            Some(state) => Ok(state),
+            None => Err(anyhow!("contract {} not found", key.id())),
+        }
+    }
+
+    /// GET that distinguishes "the node says this contract does not exist" from
+    /// "the request failed".
+    ///
+    /// The difference is load-bearing for `migrate`. Folding `NotFound` into the
+    /// same bucket as a timeout meant probing a legacy generation that genuinely
+    /// holds nothing aborted the whole migration before it reached the generation
+    /// that holds the entries. A definitive `NotFound` is exactly the
+    /// "genuinely-absent address" signal the migration needs.
+    ///
+    /// Caveat the caller must respect: `NotFound` is not an absolute proof of
+    /// absence. A contract that exists but is currently unfindable (the known
+    /// near-miss floor) also answers `NotFound`, so a caller treating `None` as
+    /// empty must say so loudly rather than silently.
+    pub async fn get_optional(
+        &mut self,
+        key: &ContractKey,
+        subscribe: bool,
+    ) -> Result<Option<Vec<u8>>> {
         let req = ContractRequest::Get {
             key: *key.id(),
             return_contract_code: false,
             subscribe,
             blocking_subscribe: subscribe,
         };
+        let want = *key.id();
         match self.roundtrip(ClientRequest::ContractOp(req)).await? {
-            HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
-                Ok(state.as_ref().to_vec())
+            // Match the identity, do not discard it. `migrate` drives several keys
+            // through ONE client in sequence, and `roundtrip` takes whatever frame
+            // arrives next, so a late reply to an earlier (timed-out) request would
+            // otherwise be attributed to the key being probed now. That used to
+            // cost an abort; now that NotFound means "absent", it would instead
+            // silently skip a generation that holds entries.
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: got,
+                state,
+                ..
+            }) => {
+                if *got.id() != want {
+                    bail!("GET response was for contract {got}, not {want}");
+                }
+                Ok(Some(state.as_ref().to_vec()))
+            }
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
+                if instance_id != want {
+                    bail!("NotFound response was for contract {instance_id}, not {want}");
+                }
+                Ok(None)
             }
             other => Err(anyhow!("unexpected GET response: {other:?}")),
         }
