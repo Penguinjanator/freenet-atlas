@@ -32,3 +32,11 @@ ed25519-dalek = { workspace = true, features = ["std"] }
 bs58 = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# Test-only: the differential assertion that the CONTRACT-enforced path guards in
+# `atlas_common::path` are never weaker than the crawler's older private copies.
+# Deliberately not a normal dependency — it is used by one `#[cfg(test)]` block, and
+# as a production dep it linked ed25519-dalek, ciborium, bs58 and rand into the
+# shipped binary for nothing.
+atlas-common = { workspace = true }
