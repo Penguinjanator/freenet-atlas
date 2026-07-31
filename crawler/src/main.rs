@@ -1719,6 +1719,7 @@ fn run_once(
     let mut added = 0usize;
     let mut unresolvable = 0usize;
     let mut refused = 0usize;
+    let mut placeholders = 0usize;
     let mut baselines = AppBaselines::default();
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
@@ -1805,7 +1806,18 @@ fn run_once(
             // hunting a registry fault that did not exist.
             Err(e) if is_deterministic_refusal(&e) => {
                 eprintln!("  deferring {loc}: {e}");
-                refused += 1;
+                // Counted apart from too-thin. One combined number cannot answer
+                // "did the placeholder guard ever fire", and that guard has now
+                // been silently inert twice — once because its probe handle was
+                // memoised, once because a failed probe cached an empty baseline.
+                // Both were invisible in the summary line.
+                if e.chain()
+                    .any(|c| c.downcast_ref::<PlaceholderPage>().is_some())
+                {
+                    placeholders += 1;
+                } else {
+                    refused += 1;
+                }
             }
             // The server asserted the resource does not exist. That IS a
             // decision, so it is marked seen like any other — no retry cycle, no
@@ -1885,9 +1897,15 @@ fn run_once(
              (left queued, no retry burned)"
         );
     }
+    if placeholders > 0 {
+        eprintln!(
+            "{placeholders} locator(s) refused as the app's missing-resource \
+             placeholder (left queued, no retry burned)"
+        );
+    }
     if refused > 0 {
         eprintln!(
-            "{refused} locator(s) deferred as too thin or placeholder \
+            "{refused} locator(s) deferred as too thin \
              (left queued, no retry burned)"
         );
     }
@@ -2522,22 +2540,116 @@ impl std::error::Error for TruncatedWalk {}
 /// synthetic handle gives a baseline to compare against — generic, no per-app
 /// knowledge, one extra render.
 ///
-/// Verified: `#zzzzzzzzzz` (a well-formed but nonexistent Delta handle) renders 2968
-/// characters of Delta's own introduction, which is exactly the text that had been
-/// published as two unrelated sites' descriptions.
-#[derive(Default)]
+/// Measured: a probe handle Delta treats as unknown renders 2968 characters of
+/// another site's page (titled "Home Page — Ian's Website"), which is the shape of
+/// text that had been published under two unrelated sites' locators. Note the old
+/// constant `#zzzzzzzzzz` renders 0 characters TODAY and no longer demonstrates
+/// this — see `synthetic_resource` for why, since that is the whole reason the
+/// probe is generated rather than fixed.
 struct AppBaselines {
     /// app slug -> whitespace-normalised text the app renders for a missing resource.
     /// `None` means the probe failed, so no comparison is possible this run.
     by_slug: HashMap<String, Option<String>>,
+    /// The handle probed for, fixed for this run and unseen before it. See
+    /// `synthetic_resource` for why it must not be a constant.
+    probe: String,
 }
 
-/// A well-formed handle that cannot belong to a real site (base58, right length, and
-/// a value no owner key would produce).
-const SYNTHETIC_RESOURCE: &str = "zzzzzzzzzz";
+impl Default for AppBaselines {
+    fn default() -> Self {
+        Self {
+            by_slug: HashMap::new(),
+            probe: synthetic_resource(),
+        }
+    }
+}
+
+/// The LENGTH of a probe handle, and why it is not 10.
+///
+/// This is load-bearing and counter-intuitive, so it gets its own constant. Delta
+/// memoises handles it is asked for into a node-local visited list, and a handle on
+/// that list renders as a "Loading..." shell rather than the missing-resource
+/// content — so a memoised probe captures the app's own chrome forever after. But it
+/// only memoises handles of ITS OWN handle length, which is 10. Measured on the live
+/// node: a 10-character probe renders 2968 characters on its first visit and 0 on
+/// its second, while a 12-character probe rendered 2968 on three consecutive visits
+/// and never appeared in the sidebar at all.
+///
+/// So do NOT "fix" this to 10 to match `MIN_APP_RESOURCE_LEN`'s note that Delta's
+/// handles are exactly 10 characters. That change keeps every test green, keeps the
+/// guard working, and starts appending a permanent junk row to the app's sidebar
+/// every hour — which is the very chrome whose contents caused the
+/// cross-contaminated descriptions this guard exists to prevent.
+const PROBE_HANDLE_LEN: usize = 12;
+
+/// A well-formed handle that cannot belong to a real site, different on every run.
+///
+/// TWO independent properties keep the probe honest, and it is worth being precise
+/// about which one currently does the work:
+///
+/// 1. LENGTH (`PROBE_HANDLE_LEN`) is what works today: an over-length handle is not
+///    memoised at all, so it keeps rendering the missing-resource content and costs
+///    the app's visited list nothing.
+/// 2. FRESHNESS is the backstop, and is currently inert. If the app ever starts
+///    memoising handles of any length, a fixed probe would go dark permanently after
+///    one visit; a per-run handle degrades to "one junk row per run" instead of "the
+///    guard silently stops working". That is the failure this whole area keeps
+///    reproducing, so the cheap insurance stays.
+///
+/// The fixed handle this replaced is the concrete precedent: `#zzzzzzzzzz` is
+/// memoised and renders 0 characters today, so the stored baseline had become the
+/// app's sidebar — and since a chrome-mode baseline can never equal a content-mode
+/// page, the guard could not fire at all.
+fn synthetic_resource() -> String {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    // Bumped per call, so two probes differ even if the clock is stuck or absent.
+    // Without it, a clock that cannot answer collapses the seed to the pid alone,
+    // which under `Restart=always` can repeat across runs — a silent slide back to
+    // a near-fixed probe, i.e. exactly the bug this function exists to prevent.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Novelty is the requirement, not unpredictability: the wall clock separates
+    // runs, the pid separates two started in the same nanosecond, and the counter
+    // covers a clock that answers neither.
+    let mut seed = nanos ^ ((std::process::id() as u128) << 96) ^ (seq << 32);
+    let mut out = String::with_capacity(PROBE_HANDLE_LEN);
+    for _ in 0..PROBE_HANDLE_LEN {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.push(ALPHABET[((seed >> 64) as usize) % ALPHABET.len()] as char);
+    }
+    out
+}
+
+/// The locator the baseline is probed with. Extracted so a test pins THIS expression
+/// rather than a copy of it: a test that rebuilds the format string proves only that
+/// its own copy resolves.
+fn probe_locator(slug: &str, probe: &str) -> String {
+    format!("app:{slug}/{probe}")
+}
 
 fn normalise_text(t: &str) -> String {
     t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Is this probe result worth storing as a baseline?
+///
+/// Non-empty is NOT the test, which is what it used to be. When the render fails,
+/// `get_page` falls back to a static fetch of the app shell, whose visible text is
+/// the five characters "Delta" — non-empty, so it was stored and logged as a
+/// successful capture, leaving the guard unable to match anything from behind a
+/// reassuring message. Any placeholder worth catching is by definition describable,
+/// so hold the baseline to the same floor a real page has to clear.
+///
+/// Split out so this is a decision a test can make directly, rather than one buried
+/// behind a network fetch and reachable only by scraping the source.
+fn baseline_is_usable(text: &str) -> bool {
+    text.chars().count() >= MIN_DESCRIBABLE_CHARS
 }
 
 impl AppBaselines {
@@ -2553,15 +2665,28 @@ impl AppBaselines {
         text: &str,
     ) -> bool {
         if !self.by_slug.contains_key(slug) {
-            let probe = format!("app:{slug}/{SYNTHETIC_RESOURCE}");
+            let probe = probe_locator(slug, &self.probe);
+            // Non-empty is NOT enough. If the render fails, `get_page` falls back to
+            // a static fetch of the app shell, whose visible text is the five
+            // characters "Delta" — non-empty, so it was stored as the baseline and
+            // logged as a successful capture, leaving the guard unable to match
+            // anything behind a reassuring message. A baseline worth having is a
+            // page the app actually rendered, and any placeholder this guard is
+            // meant to catch is by definition describable, so hold it to the same
+            // floor a real page must clear.
             let baseline = get_page(cli, client, gw, &probe, registry)
                 .ok()
                 .map(|p| normalise_text(&p.text))
-                .filter(|t| !t.is_empty());
+                .filter(|t| baseline_is_usable(t));
             match &baseline {
+                // The opening text, not just the length. A length alone cannot
+                // distinguish the app's fallback CONTENT from its chrome, and
+                // storing the chrome is precisely how this guard spent its life
+                // unable to match anything while logging a healthy-looking number.
                 Some(b) => eprintln!(
-                    "  app `{slug}`: captured a {}-char missing-resource baseline",
-                    b.len()
+                    "  app `{slug}`: captured a {}-char missing-resource baseline: {:.60}…",
+                    b.len(),
+                    b
                 ),
                 None => eprintln!(
                     "  app `{slug}`: could not capture a missing-resource baseline, so \
@@ -5406,6 +5531,122 @@ mod tests {
         );
     }
 
+    /// The probe handle must differ between runs, and must be a handle the app
+    /// would accept as well-formed.
+    ///
+    /// A FIXED handle is the defect: the app memoises every handle it is asked for,
+    /// so a constant probe captures the real missing-resource content once in a
+    /// node's lifetime and the app's chrome on every run afterwards. The guard then
+    /// compares content-mode pages against a chrome-mode baseline, which can never
+    /// match, so it silently stops firing — as it had, for ten days of journal.
+    #[test]
+    fn the_probe_handle_is_fresh_every_run() {
+        let a = synthetic_resource();
+        let b = synthetic_resource();
+        assert_ne!(
+            a, b,
+            "two probes in one process must differ; a constant handle is the bug"
+        );
+        // Two calls differing proves only that SOMETHING varies — a per-call
+        // counter would satisfy it while the handle repeated across restarts.
+        // The property is that it derives from the wall clock, and only the
+        // source can say so.
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn the_probe_handle_is_fresh"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let at = production
+            .find("fn synthetic_resource()")
+            .expect("synthetic_resource must exist");
+        let body = strip_comments(&production[at..]);
+        assert!(
+            body.contains("SystemTime::now()"),
+            "the handle must derive from the wall clock, or it repeats across runs"
+        );
+        // The length is load-bearing: an app memoises handles of its OWN length,
+        // and a memoised probe renders its chrome forever after.
+        assert!(
+            a.chars().count() == PROBE_HANDLE_LEN && PROBE_HANDLE_LEN > MIN_APP_RESOURCE_LEN,
+            "the probe must be LONGER than the app's own handles, or it joins the \
+             app's visited list and stops rendering the fallback"
+        );
+        for h in [&a, &b] {
+            assert!(
+                h.len() >= MIN_APP_RESOURCE_LEN && h.len() <= 64,
+                "probe {h} must pass the resource-handle length check, or \
+                 `app_of` rejects it and no baseline is ever captured"
+            );
+            assert!(
+                h.chars().all(is_base58),
+                "probe {h} must be base58, for the same reason"
+            );
+        }
+    }
+
+    /// A baseline that is merely non-empty is not a baseline.
+    ///
+    /// The static-fetch fallback yields the app shell's five-character visible text,
+    /// "Delta". Stored, it becomes a baseline no real page can ever equal, and the
+    /// run logs a successful capture — the guard off, invisibly. That is the second
+    /// time this guard has been silently inert, so the threshold is a decision with
+    /// a test rather than a filter with a comment.
+    #[test]
+    fn a_too_short_probe_result_is_not_a_usable_baseline() {
+        assert!(
+            !baseline_is_usable("Delta"),
+            "the app shell's static-fetch text must not be stored as a baseline"
+        );
+        assert!(
+            !baseline_is_usable(""),
+            "and neither must an empty probe result"
+        );
+        let real = "x".repeat(MIN_DESCRIBABLE_CHARS);
+        assert!(
+            baseline_is_usable(&real),
+            "a probe result that clears the describable floor IS usable, or the \
+             guard can never arm at all"
+        );
+        assert!(
+            !baseline_is_usable(&"x".repeat(MIN_DESCRIBABLE_CHARS - 1)),
+            "bound is two-sided: one character under the floor must be refused"
+        );
+    }
+
+    /// The probe must go through the SAME validation a real locator does.
+    ///
+    /// If `app_of` rejects the generated handle, `resolve_for_fetch` never runs, the
+    /// probe fails, `AppBaselines` caches `None`, and placeholder detection is off
+    /// for the run — the exact silent-disarm this whole area keeps producing. The
+    /// length and alphabet asserts above are necessary but check the rule rather
+    /// than the code that enforces it, so drive the real resolver.
+    #[test]
+    fn a_probe_locator_survives_resource_validation() {
+        let reg = AppRegistryView {
+            apps: vec![AppView {
+                slug: "delta".into(),
+                contract_id: RIVER.into(),
+                prefix: "/#".into(),
+            }],
+        };
+        // Built by the PRODUCTION expression, not a copy of it: a test that
+        // rebuilds the format string proves only that its own copy resolves.
+        let probe = probe_locator("delta", &synthetic_resource());
+        assert_eq!(
+            reg.app_of(&probe).map(|(s, _)| s),
+            Some("delta".to_string()),
+            "the probe locator must resolve, or the baseline is never captured"
+        );
+        assert!(
+            reg.resolve_for_fetch(&probe).is_some(),
+            "and must be fetchable"
+        );
+    }
+
     /// The renderer half of the same fix, which no Rust test can otherwise reach.
     ///
     /// `extra_texts` is populated from exactly one line of JavaScript. Delete it and
@@ -6508,6 +6749,8 @@ mod tests {
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
+            "fn the_probe_handle_is_fresh_every_run",
+            "fn a_too_short_probe_result_is_not_a_usable_baseline",
             "fn a_truncated_walk_is_refused_rather_than_decided",
             "fn the_give_up_branch_quarantines_and_does_not_blacklist",
             "fn strip_comments",
