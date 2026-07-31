@@ -127,6 +127,11 @@ struct Cli {
     /// (default: <key_dir>/crawler-pending.txt).
     #[arg(long)]
     pending: Option<PathBuf>,
+    /// File tracking locators that burned their retries on transient errors and
+    /// are held before being queued again
+    /// (default: <key_dir>/crawler-quarantine.txt).
+    #[arg(long)]
+    quarantine: Option<PathBuf>,
     /// Max LLM-billed attempts per run.
     #[arg(long, default_value_t = 20)]
     max: usize,
@@ -411,6 +416,13 @@ const CURATED_AUTHOR: &str = "@curated";
 /// A locator queued for description: `(locator, kind, author)`.
 type QueuedLocator = (String, &'static str, String);
 
+/// A locator released from quarantine: `(cycles, locator, kind, author)`.
+///
+/// The entry itself stays in the quarantine file; this is only the hand-off to
+/// the queue. The caller reports back with `mark_attempted` or `defer_placement`
+/// so a refused placement never burns one of the locator's retry cycles.
+type ReleasedLocator = (u32, String, &'static str, String);
+
 #[derive(Clone)]
 struct PendingEntry {
     kind: &'static str,
@@ -670,8 +682,12 @@ impl Pending {
     }
 
     /// Record a transient failure. Returns true once the locator has burned
-    /// `MAX_ATTEMPTS` and should be given up on (and marked seen, so it is never
-    /// reconsidered).
+    /// `MAX_ATTEMPTS` and should be given up on.
+    ///
+    /// Giving up means QUARANTINE, not seen. This doc used to say "and marked
+    /// seen, so it is never reconsidered", which is exactly the instruction that
+    /// lost real sites: failing to REACH a locator is not a decision about it.
+    /// The caller must hand it to [`Quarantine::hold`].
     fn record_failure(&mut self, loc: &str) -> bool {
         let Some((_, e)) = self.entries.iter_mut().find(|(l, _)| l == loc) else {
             return true;
@@ -784,9 +800,15 @@ impl Pending {
 
     /// Persist the queue if it changed. Written atomically via a uniquely-named
     /// sibling so a crash mid-write cannot truncate the backlog.
-    fn save(&mut self) {
+    ///
+    /// Returns false if the write failed. The phase-1 save is the one that makes
+    /// a just-released locator durable, so the quarantine must NOT go on to
+    /// record that release if this failed — the locator would then be in neither
+    /// file.
+    #[must_use]
+    fn save(&mut self) -> bool {
         if !self.dirty {
-            return;
+            return true;
         }
         let body: String = std::iter::once(format!("#cursor\t{}\n", self.cursor))
             .chain(
@@ -798,12 +820,552 @@ impl Pending {
         let tmp = sibling_tmp(&self.path);
         if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
             self.dirty = false;
+            true
         } else {
             let _ = fs::remove_file(&tmp);
             eprintln!(
                 "warn: could not persist pending queue {} — discovered links may be re-described",
                 self.path.display()
             );
+            false
+        }
+    }
+}
+
+/// Base cooldown for a locator that burned `MAX_ATTEMPTS` on TRANSIENT errors.
+///
+/// Doubles on each cycle (see `due_after`), so a link that keeps failing costs
+/// geometrically less over time instead of the same 3 attempts every week.
+const QUARANTINE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How many retry cycles a locator gets before we accept that it is gone and
+/// mark it seen for good.
+///
+/// This is the third state the first version of this type was missing. Without
+/// it the quarantine has no terminal state: a released locator re-enters the
+/// queue with its attempt count reset, so every dead link costs `MAX_ATTEMPTS`
+/// billed attempts per cycle FOREVER. With `--daily-max 200` and 3 attempts a
+/// cycle, ~467 dead links is enough for re-testing them to consume the entire
+/// daily budget in perpetuity and the index to stop growing — reachable by
+/// ordinary link rot in months. Four cycles at a doubling cooldown gives a
+/// genuinely transient outage four chances across ~15 weeks, and caps the
+/// lifetime cost of a dead link at 12 attempts rather than an unbounded rate.
+const MAX_QUARANTINE_CYCLES: u32 = 4;
+
+/// How long to wait before retrying a release the QUEUE refused (as opposed to
+/// one that was attempted and failed). Short, because nothing was learned about
+/// the locator — only that there was no room for it.
+const REFUSED_RETRY_SECS: u64 = 60 * 60;
+
+/// How many consecutive refusals before one is counted as a retry cycle.
+///
+/// A refusal deliberately does not burn a cycle, because nothing was learned
+/// about the locator. But an entry the queue can NEVER accept would then never
+/// reach the terminal state at all: it would re-release hourly for ever, hold a
+/// slot in its author's share, and — being due soonest — sit at exactly the end
+/// the trim protects, so it would outlive entries with real retry history. After
+/// a day of being unplaceable, treat that as a cycle so it still converges.
+const MAX_CONSECUTIVE_DEFERS: u32 = 24;
+
+/// Upper bound on the quarantine file, so a pathological source cannot grow it
+/// without limit.
+///
+/// This number is load-bearing for more than file size. The global trim picks
+/// victims by furthest-due across ALL authors, so reaching it lets one source
+/// retire another's most-cycled entries. At 5 000, with the per-author cap at
+/// 200, getting there deliberately costs ~15 000 billed attempts across ~25
+/// identities — about 75 days at `--daily-max 200` — to accelerate a decision
+/// that was already three-quarters made, so it is not worth an attacker's time.
+/// The realistic route to the trim firing at all is a large curated sources
+/// file, since `CURATED_AUTHOR` is exempt from the per-author cap.
+///
+/// If this is ever lowered substantially, or `MAX_PENDING_PER_AUTHOR` raised,
+/// that cross-author reasoning no longer holds and deserves a fresh look.
+const MAX_QUARANTINE: usize = 5_000;
+
+/// Why a locator left the quarantine for good.
+///
+/// These arrive by different routes and mean different things to an operator
+/// asking "why is this site missing", so they must not share one message. The
+/// `journalctl | grep 'giving up on'` line is the forensic record that replaces
+/// the undifferentiated seen file (see the recovery issue), and telling someone a
+/// link burned four retry cycles when it actually lost a capacity contest on its
+/// first day sends them to exactly the wrong conclusion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Decided {
+    /// Spent every retry cycle. Genuinely dead as far as we can tell.
+    Exhausted,
+    /// Dropped because the file hit `MAX_QUARANTINE`. May have zero cycles.
+    OverCapacity,
+    /// Dropped because this author's share was already full. May have zero
+    /// cycles, and says nothing about the file's overall size.
+    OverAuthorShare,
+}
+
+impl Decided {
+    fn why(&self) -> String {
+        match self {
+            Self::Exhausted => {
+                format!("after all {MAX_QUARANTINE_CYCLES} retry cycles were spent")
+            }
+            Self::OverCapacity => format!(
+                "the quarantine is at its {MAX_QUARANTINE}-entry limit — this was a \
+                 capacity eviction, NOT retry exhaustion, so it may never have been \
+                 retried at all"
+            ),
+            Self::OverAuthorShare => format!(
+                "this author already held its {MAX_PENDING_PER_AUTHOR}-entry share — \
+                 an author-share eviction, NOT retry exhaustion and NOT the file's \
+                 overall limit, so it may never have been retried at all"
+            ),
+        }
+    }
+}
+
+/// When a locator on its `cycles`-th cycle next becomes eligible.
+fn due_after(cycles: u32, now: u64) -> u64 {
+    let mult = 1u64.checked_shl(cycles).unwrap_or(u64::MAX);
+    now.saturating_add(QUARANTINE_SECS.saturating_mul(mult))
+}
+
+/// Locators that failed `MAX_ATTEMPTS` times in a row for TRANSIENT reasons,
+/// held until they are due again, then re-queued — and finally given up on for
+/// good after `MAX_QUARANTINE_CYCLES`.
+///
+/// This exists because "give up" and "never reconsider" are different
+/// decisions, and conflating them lost real sites. A locator that burned its
+/// attempts used to be written to `crawler-seen.txt`, which is append-only and
+/// never re-read for retry — so three timeouts against a node that happened to
+/// be restarting excluded a perfectly good site from the index permanently.
+/// `Pyvdo1wUC1PG…` (a real Freenet site) was lost exactly this way: three HTTP
+/// 500s during a dead-end window, blacklisted for good, still serving HTTP 200
+/// afterwards.
+///
+/// Marking seen is still right for a locator we have DECIDED about — indexed,
+/// refused by the content-safety gate, or permanently gone (a 404). It is wrong
+/// for one we merely failed to reach.
+///
+/// An entry STAYS in this file from the moment it is held until it is decided.
+/// It is not removed when it comes due. That is what makes the cycle count
+/// durable, and it is why `MAX_QUARANTINE` is a real bound: an earlier version
+/// removed released entries at load and re-appended refused ones afterwards, so
+/// the trim only ever measured the still-cooling subset and the file could grow
+/// without limit while a test asserted the opposite.
+///
+/// Entries carry their queue metadata (`kind`, `author`) so a release re-queues
+/// them directly rather than waiting to rediscover them. That matters for a
+/// River room, whose history is bounded: the message carrying the link may be
+/// long gone by the time the hold expires.
+struct Quarantine {
+    path: PathBuf,
+    /// `locator -> (due_at, cycles, kind, author)`.
+    entries: HashMap<String, QuarantineEntry>,
+    dirty: bool,
+}
+
+#[derive(Clone)]
+struct QuarantineEntry {
+    due_at: u64,
+    cycles: u32,
+    /// Consecutive times the queue refused this locator, reset on placement.
+    defers: u32,
+    kind: &'static str,
+    author: String,
+}
+
+impl Quarantine {
+    /// Load, and split at the two boundaries that matter: locators due for
+    /// another attempt, and locators that have exhausted every cycle and must
+    /// now be marked seen by the caller.
+    ///
+    /// `seen` purges entries already decided about, so a locator that was
+    /// eventually indexed does not linger.
+    fn load(
+        path: &Path,
+        now: u64,
+        seen: &HashSet<String>,
+    ) -> (Self, Vec<ReleasedLocator>, Vec<(String, Decided)>) {
+        let mut q = Self {
+            path: path.to_path_buf(),
+            entries: HashMap::new(),
+            dirty: false,
+        };
+        let mut released: Vec<ReleasedLocator> = Vec::new();
+        // Locators leaving this file permanently: out of cycles, or trimmed.
+        let mut decided: Vec<(String, Decided)> = Vec::new();
+        let mut dropped = 0usize;
+        let Ok(body) = fs::read_to_string(path) else {
+            return (q, released, decided);
+        };
+        for line in body.lines() {
+            // due_at \t cycles \t defers \t kind \t author \t locator
+            // (locator last: it may not contain a tab, so this parses
+            // unambiguously).
+            // Dispatch on FIELD COUNT so an older line upgrades in place instead
+            // of being discarded.
+            //
+            // A trailing `unwrap_or` cannot do this: the locator is last, so a
+            // field added in the middle shifts every column after it — a 5-field
+            // line read positionally would take `kind` as `defers`, `author` as
+            // `kind`, and the locator as `author`. Splitting on count is the only
+            // form that reads both shapes correctly.
+            //
+            // This has already changed twice on this branch (adding `cycles`, then
+            // `defers`). Doing it now is free because the file has never shipped;
+            // after merge it holds real durable state, and a third change without
+            // this would silently wipe it while reporting "no longer validate",
+            // which misattributes a schema change as a validation failure. A new
+            // field means a new arm here.
+            let f: Vec<&str> = line.splitn(6, '\t').collect();
+            let (due, cycles, defers, author, loc) = match f.len() {
+                // due, cycles, defers, kind, author, locator  (current)
+                6 => (f[0], f[1], f[2], f[4], f[5]),
+                // due, cycles, kind, author, locator
+                5 => (f[0], f[1], "0", f[3], f[4]),
+                // due, kind, author, locator
+                4 => (f[0], "0", "0", f[2], f[3]),
+                _ => {
+                    dropped += 1;
+                    q.dirty = true;
+                    continue;
+                }
+            };
+            // An upgraded line must be rewritten in the current shape.
+            if f.len() != 6 {
+                q.dirty = true;
+            }
+            let loc = loc.trim();
+            if loc.is_empty() {
+                dropped += 1;
+                q.dirty = true;
+                continue;
+            }
+            // `author` is the only field taken verbatim from disk, and it is also
+            // a rate-limit bucket key. Reject the separators outright rather than
+            // relying on every future producer keeping them out: a newline here
+            // would let one entry forge another, and a forged far-future entry is
+            // invisible to discovery for as long as it sits there.
+            // NOTE: this cannot fire from a well-formed file, and that is not an
+            // oversight. `author` is the field BETWEEN tabs, so an embedded tab
+            // pushes the remainder into the locator, which `normalize_href`
+            // rejects below; an embedded newline ends the line. Kept as a cheap
+            // belt-and-braces read of an untrusted file, with the real
+            // enforcement at `hold`, where an author actually enters and where a
+            // future author source could introduce one.
+            if author.contains(['\t', '\n']) {
+                dropped += 1;
+                q.dirty = true;
+                continue;
+            }
+            // Re-validate on the way in and take `kind` from the re-validation,
+            // for the same reason the pending queue does: this file is durable,
+            // so an entry captured under an earlier build's guards must not be
+            // re-queued without being re-checked.
+            let Some((canon, kind)) = normalize_href(loc) else {
+                dropped += 1;
+                q.dirty = true;
+                continue;
+            };
+            // Already decided about — indexed, or refused by the safety gate.
+            if seen.contains(&canon) {
+                q.dirty = true;
+                continue;
+            }
+            // `mark_attempted` can only ever write up to MAX_QUARANTINE_CYCLES, so
+            // anything above it is corrupt. Treat it as 0 rather than as
+            // "exhausted": every other parse failure in this file fails OPEN, and
+            // this is the one input that would otherwise fail CLOSED into a
+            // permanent blacklist.
+            let cycles: u32 = cycles.trim().parse().unwrap_or(0);
+            let cycles = if cycles > MAX_QUARANTINE_CYCLES {
+                0
+            } else {
+                cycles
+            };
+            // An unparseable due time is treated as "due now". Failing OPEN is
+            // the safe direction: the cost of retrying early is a few billed
+            // attempts, the cost of failing closed is losing the link.
+            //
+            // A FUTURE-dated entry beyond the longest cooldown it could legally
+            // have is clamped for the same reason — otherwise a clock that ran
+            // ahead once (a container started before NTP synced) holds the
+            // locator for years, invisible to discovery because it stays in the
+            // capture filter, which is precisely the permanent exclusion this
+            // type exists to remove.
+            let due: u64 = due.trim().parse().unwrap_or(0);
+            let ceiling = due_after(cycles, now);
+            let due_at = due.min(ceiling);
+            if due_at != due {
+                q.dirty = true;
+            }
+            if q.entries.contains_key(&canon) {
+                dropped += 1;
+                q.dirty = true;
+                continue;
+            }
+            if cycles >= MAX_QUARANTINE_CYCLES {
+                // Out of chances. The caller marks it seen; it leaves this file.
+                decided.push((canon, Decided::Exhausted));
+                q.dirty = true;
+                continue;
+            }
+            if now >= due_at {
+                released.push((cycles, canon.clone(), kind, author.to_string()));
+            }
+            q.entries.insert(
+                canon,
+                QuarantineEntry {
+                    due_at,
+                    cycles,
+                    // Clamped like `cycles`: an out-of-range value is corrupt,
+                    // and without the clamp `u32::MAX` panics on the next `+= 1`
+                    // in a debug build.
+                    defers: defers
+                        .trim()
+                        .parse()
+                        .unwrap_or(0)
+                        .min(MAX_CONSECUTIVE_DEFERS),
+                    kind,
+                    author: author.to_string(),
+                },
+            );
+        }
+        // The PER-AUTHOR bound is enforced here too, not only in `hold`. This is
+        // the failure `Pending::load` documents a few hundred lines up: `hold`
+        // evicts exactly one entry per insertion, so a bucket that arrives
+        // oversized — a hand-edit, or a later lowering of the constant — adds one
+        // and removes one for ever and never trims back down.
+        let mut per_author: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+        for (loc, e) in &q.entries {
+            if e.author != CURATED_AUTHOR {
+                per_author
+                    .entry(e.author.clone())
+                    .or_default()
+                    .push((loc.clone(), e.due_at));
+            }
+        }
+        for (_, mut own) in per_author {
+            if own.len() <= MAX_PENDING_PER_AUTHOR {
+                continue;
+            }
+            // Same victim rule as `hold` and the global trim: furthest-due first.
+            own.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            for (loc, _) in own.drain(MAX_PENDING_PER_AUTHOR..) {
+                q.entries.remove(&loc);
+                released.retain(|(_, l, _, _)| l != &loc);
+                decided.push((loc, Decided::OverAuthorShare));
+            }
+            q.dirty = true;
+        }
+
+        // The GLOBAL bound is enforced over EVERY entry, due or not, because every
+        // entry stays in the map until it is decided.
+        let over = q.entries.len().saturating_sub(MAX_QUARANTINE);
+        if over > 0 {
+            // Drop the entries due FURTHEST out. Note what that actually
+            // selects, because it is NOT the recoverability argument
+            // `Pending::evict_one` makes: a freshly-held entry is due in one
+            // week, a thrice-cycled one in eight, so the newest sits at the
+            // PROTECTED end and what goes is the most-backed-off. That is
+            // defensible on its own terms — an entry that has already failed
+            // three cycles is the likeliest to be genuinely dead, and it has
+            // spent most of its retry budget either way — but it is a
+            // most-likely-dead rule, not a most-recoverable one.
+            let mut by_due: Vec<(String, u64)> = q
+                .entries
+                .iter()
+                .map(|(l, e)| (l.clone(), e.due_at))
+                .collect();
+            by_due.sort_by_key(|(l, d)| (*d, l.clone()));
+            for (loc, _) in by_due.into_iter().rev().take(over) {
+                q.entries.remove(&loc);
+                released.retain(|(_, l, _, _)| l != &loc);
+                // Marked seen by the caller rather than dropped. A trimmed entry
+                // is already out of the pending queue, so dropping it silently
+                // would leave it in no file at all.
+                decided.push((loc, Decided::OverCapacity));
+            }
+            q.dirty = true;
+            eprintln!(
+                "warn: quarantine held {over} entr(ies) over the {MAX_QUARANTINE} limit — \
+                 gave up on those due furthest out (the most-cycled, so the \
+                 likeliest to be genuinely dead); each is marked seen and named \
+                 individually above"
+            );
+        }
+        if dropped > 0 {
+            eprintln!("warn: dropped {dropped} quarantined locator(s) that no longer validate");
+        }
+        (q, released, decided)
+    }
+
+    /// Hold a locator that has burned its attempts on transient errors.
+    ///
+    /// A locator already here keeps its existing schedule: it is mid-cycle, and
+    /// `mark_attempted` has already advanced it.
+    /// Returns a locator the caller must now mark SEEN, if holding this one
+    /// pushed its author over their share. It must never simply be dropped: by
+    /// the time this is called `record_failure` has already removed the locator
+    /// from the pending queue, so a silent drop leaves it in NO file at all —
+    /// the exact loss this whole type exists to remove, one level down.
+    /// Whatever leaves here leaves as a DECISION, with a log line.
+    #[must_use]
+    fn hold(&mut self, loc: &str, kind: &'static str, author: &str, now: u64) -> Option<String> {
+        if self.entries.contains_key(loc) {
+            return None;
+        }
+        // An author carrying a field separator would let one entry forge another
+        // on the next read, and a forged far-future entry is invisible to
+        // discovery for as long as it sits there. Reject rather than sanitise: a
+        // sanitised author is silently a DIFFERENT rate-limit bucket. Unreachable
+        // from today's callers (@hub, @curated, or MemberId's base32), so this
+        // guards a future author source. The locator still leaves as a decision.
+        if author.contains(['\t', '\n']) {
+            eprintln!("warn: refusing to quarantine {loc} under an author carrying a separator");
+            return Some(loc.to_string());
+        }
+        self.entries.insert(
+            loc.to_string(),
+            QuarantineEntry {
+                due_at: due_after(0, now),
+                cycles: 0,
+                defers: 0,
+                kind,
+                author: author.to_string(),
+            },
+        );
+        self.dirty = true;
+        // One author cannot occupy the whole file. Without this, `Pending`'s
+        // per-author cap is defeated one level down: a single room member could
+        // fill the quarantine and so own the recurring retry budget outright.
+        if author == CURATED_AUTHOR {
+            return None;
+        }
+        let own: Vec<(String, u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.author == author)
+            .map(|(l, e)| (l.clone(), e.due_at))
+            .collect();
+        if own.len() <= MAX_PENDING_PER_AUTHOR {
+            return None;
+        }
+        // The victim is the entry due FURTHEST out — it has already failed the
+        // most cycles, so it is both nearest to being given up on anyway and
+        // furthest from another attempt. Same tiebreak as the global trim. That
+        // may be the locator just inserted, which is correct: an author already
+        // at their cap should not displace better candidates.
+        let victim = own
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+            .map(|(l, _)| l)?;
+        self.entries.remove(&victim);
+        Some(victim)
+    }
+
+    /// A released locator was actually handed to the queue: burn the cycle and
+    /// schedule the next one further out.
+    fn mark_attempted(&mut self, loc: &str, now: u64) {
+        if let Some(e) = self.entries.get_mut(loc) {
+            e.cycles += 1;
+            e.defers = 0;
+            e.due_at = due_after(e.cycles, now);
+            self.dirty = true;
+        }
+    }
+
+    /// A released locator that is ALREADY in the queue, just not drained yet.
+    ///
+    /// Distinct from a refusal, and it must stay distinct. The queue accepted
+    /// this locator on an earlier run; it simply has not come up in the drain
+    /// order. Counting that toward the refusal budget means a deep backlog can
+    /// walk a perfectly good locator through all four cycles and blacklist it
+    /// without a single re-attempt — which is what the refusal branch's own
+    /// comment says must not happen, just more slowly.
+    /// Known tradeoff: this parks the entry at the SOONEST-due end, which is the
+    /// end both the author-share eviction and the global trim protect. So a
+    /// safely-queued locator that needs no protection outranks one genuinely
+    /// waiting out a backoff. Mild, and far better than the alternative it
+    /// replaced (blacklisting it outright) — but if victim selection is ever
+    /// revisited, preferring undrained entries as victims is free: their locator
+    /// is in `pending` regardless, so only the cycle count is lost.
+    fn defer_undrained(&mut self, loc: &str, now: u64) {
+        if let Some(e) = self.entries.get_mut(loc) {
+            e.due_at = now.saturating_add(REFUSED_RETRY_SECS);
+            self.dirty = true;
+        }
+    }
+
+    /// A released locator the queue REFUSED. Nothing was learned about it, so do
+    /// not burn a cycle — just try again shortly, once the queue may have drained.
+    fn defer_placement(&mut self, loc: &str, now: u64) {
+        if let Some(e) = self.entries.get_mut(loc) {
+            e.defers += 1;
+            if e.defers >= MAX_CONSECUTIVE_DEFERS {
+                // Unplaceable for a day. Count it as a cycle so an entry the
+                // queue can never accept still converges instead of living for
+                // ever at the soonest-due end of the file.
+                e.cycles += 1;
+                e.defers = 0;
+                e.due_at = due_after(e.cycles, now);
+            } else {
+                e.due_at = now.saturating_add(REFUSED_RETRY_SECS);
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Drop a locator that has been decided about.
+    fn forget(&mut self, loc: &str) {
+        if self.entries.remove(loc).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// The locators being held, for the capture filter.
+    fn held(&self) -> impl Iterator<Item = String> + '_ {
+        self.entries.keys().cloned()
+    }
+
+    /// Returns false if the file could not be written.
+    ///
+    /// The caller MUST treat that as fatal for the run and stop before saving the
+    /// pending queue. `record_failure` has already removed this run's given-up
+    /// locators from the queue in memory, so persisting the queue after a failed
+    /// quarantine write would record their removal while nothing recorded where
+    /// they went — losing them from every file, which is the failure this whole
+    /// type exists to prevent.
+    #[must_use]
+    fn save(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let mut lines: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(loc, e)| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    e.due_at, e.cycles, e.defers, e.kind, e.author, loc
+                )
+            })
+            .collect();
+        // Deterministic on-disk order, so a diff of this file is readable.
+        lines.sort();
+        let body: String = lines.concat();
+        let tmp = sibling_tmp(&self.path);
+        if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
+            self.dirty = false;
+            true
+        } else {
+            let _ = fs::remove_file(&tmp);
+            eprintln!(
+                "error: could not persist quarantine {} — abandoning this run before \
+                 the pending queue is saved, so the locators given up on this run \
+                 stay in the queue on disk rather than vanishing",
+                self.path.display()
+            );
+            false
         }
     }
 }
@@ -847,10 +1409,50 @@ fn main() -> Result<()> {
         .pending
         .clone()
         .unwrap_or_else(|| key_dir.join("crawler-pending.txt"));
+    let quarantine_path = cli
+        .quarantine
+        .clone()
+        .unwrap_or_else(|| key_dir.join("crawler-quarantine.txt"));
+    // Two of these pointing at the same file is not a harmless misconfiguration.
+    // The quarantine and the pending queue share a line shape but NOT a first
+    // column (a unix timestamp vs an attempt count), so if they collide, every
+    // reloaded entry reads as having burned ~2e9 attempts — far past
+    // MAX_ATTEMPTS — and the whole queue is given up on at once. Both writers
+    // also compute the same `sibling_tmp` name within one process, so the atomic
+    // renames race. Cheaper to refuse than to debug.
+    // Compared after canonicalization where possible, so `./a.txt` and `a.txt`,
+    // or a symlink, cannot slip past. A path that does not exist yet cannot be
+    // canonicalized, so fall back to the literal — which still catches the
+    // realistic misconfiguration of naming the same path twice.
+    let real = |p: &PathBuf| fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+    let paths = [
+        ("--seen", real(&seen_path)),
+        ("--spend", real(&spend_path)),
+        ("--pending", real(&pending_path)),
+        ("--quarantine", real(&quarantine_path)),
+    ];
+    for (i, (name_a, a)) in paths.iter().enumerate() {
+        for (name_b, b) in &paths[i + 1..] {
+            if a == b {
+                anyhow::bail!(
+                    "{name_a} and {name_b} both point at {} — they hold different \
+                     formats and would corrupt each other",
+                    a.display()
+                );
+            }
+        }
+    }
     let mut state = CrawlState::default();
 
     loop {
-        if let Err(e) = run_once(&cli, &seen_path, &spend_path, &pending_path, &mut state) {
+        if let Err(e) = run_once(
+            &cli,
+            &seen_path,
+            &spend_path,
+            &pending_path,
+            &quarantine_path,
+            &mut state,
+        ) {
             eprintln!("crawl run error: {e:#}");
         }
         match cli.interval {
@@ -864,11 +1466,78 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Put every released locator back to work, and put back into quarantine any the
+/// queue refuses.
+///
+/// Extracted from `run_once` so it can be tested directly. It USED to be inlined,
+/// and the unit test reproduced it — which pinned nothing: the reproduction and
+/// the original could drift, and the one-token mutation that matters
+/// (re-holding at `now_secs()` instead of the original `at`) passed the whole
+/// suite while starving the locator by a fresh cooldown on every run.
+///
+/// Returns `(requeued, held_back)`.
+fn requeue_released(
+    released: Vec<ReleasedLocator>,
+    seen: &HashSet<String>,
+    pending: &mut Pending,
+    quarantine: &mut Quarantine,
+    now: u64,
+) -> (usize, usize) {
+    let mut requeued = 0usize;
+    let mut held_back = 0usize;
+    for (_cycles, loc, kind, author) in released {
+        // Already decided about: drop it, the release was a no-op.
+        if seen.contains(&loc) {
+            quarantine.forget(&loc);
+            continue;
+        }
+        if pending.add(&loc, kind, &author) {
+            // Genuinely handed to the queue: this cycle is spent, and the next
+            // one is scheduled further out.
+            quarantine.mark_attempted(&loc, now);
+            requeued += 1;
+        } else if pending.contains(&loc) {
+            // Already sitting in the queue from an earlier run and not yet
+            // drained. Nothing was learned about it — it simply has not come up
+            // in the drain order — so it must NOT burn a cycle, and must not
+            // count toward the refusal budget either: a deep backlog would
+            // otherwise walk it through all four cycles and blacklist it without
+            // a single re-attempt.
+            quarantine.defer_undrained(&loc, now);
+            requeued += 1;
+        } else {
+            // The queue REFUSED it (author cap, or full and nothing evictable).
+            // Nothing was learned about the locator, so do NOT burn a cycle —
+            // come back shortly, once the queue may have drained. The entry never
+            // left the quarantine file, so it cannot be lost here.
+            quarantine.defer_placement(&loc, now);
+            held_back += 1;
+            debug_assert!(
+                quarantine.held().any(|h| h == loc),
+                "a deferred locator must still be held, or it is lost"
+            );
+        }
+    }
+    (requeued, held_back)
+}
+
+/// What discovery must NOT re-capture: everything already decided about, plus
+/// everything still cooling down in quarantine.
+///
+/// Without the quarantine half, discovery re-queues on the very next run exactly
+/// what phase 2 just gave up on, so the hold is a no-op and the locator burns
+/// budget every run. `seen` itself stays the record of what has been DECIDED,
+/// and is what phase 2 appends to.
+fn capture_filter(seen: &HashSet<String>, quarantine: &Quarantine) -> HashSet<String> {
+    seen.iter().cloned().chain(quarantine.held()).collect()
+}
+
 fn run_once(
     cli: &Cli,
     seen_path: &Path,
     spend_path: &Path,
     pending_path: &Path,
+    quarantine_path: &Path,
     state: &mut CrawlState,
 ) -> Result<()> {
     let mut seen = load_seen(seen_path);
@@ -936,6 +1605,29 @@ fn run_once(
     // can be evicted before we could afford to describe it. So we always record
     // what exists, then decide separately what we can afford to describe.
     let mut pending = Pending::load(pending_path);
+    // Locators given up on for transient reasons, plus the ones whose hold has
+    // now expired. Released entries are re-queued directly rather than waiting to
+    // be rediscovered, because a River room's history is bounded and the message
+    // that carried the link may be gone by now.
+    let (mut quarantine, released, decided) = Quarantine::load(quarantine_path, now_secs(), &seen);
+    // Out of retry cycles. THIS is where a locator legitimately becomes
+    // permanent: not because one fetch failed, but because several attempts
+    // spread over months all did. Without this terminal state the quarantine has
+    // no bottom, and re-testing dead links eventually consumes the whole budget.
+    for (loc, why) in &decided {
+        eprintln!("giving up on {loc} for good: {}", why.why());
+        seen.insert(loc.clone());
+        append_seen(seen_path, loc);
+    }
+    let (requeued, held_back) =
+        requeue_released(released, &seen, &mut pending, &mut quarantine, now_secs());
+    if requeued > 0 {
+        eprintln!("released {requeued} locator(s) from quarantine for retry");
+    }
+    if held_back > 0 {
+        eprintln!("warn: {held_back} released locator(s) did not fit the queue — kept quarantined");
+    }
+    let suppressed = capture_filter(&seen, &quarantine);
     // Loaded once per run: which apps the curator has registered, so an app-hosted
     // link can be recognised as a resource rather than as its container.
     let registry = AppRegistryView::load(cli);
@@ -966,7 +1658,15 @@ fn run_once(
                 continue;
             }
             state.last_hub_crawl.insert(hub.clone(), Instant::now());
-            captured += crawl_hub(cli, &client, &gw, &hub, &seen, &mut pending, &registry);
+            captured += crawl_hub(
+                cli,
+                &client,
+                &gw,
+                &hub,
+                &suppressed,
+                &mut pending,
+                &registry,
+            );
         } else if let Some(owner_vk) = line
             .strip_prefix("river-room ")
             .or_else(|| line.strip_prefix("river-room:"))
@@ -976,7 +1676,7 @@ fn run_once(
             // re-keys on every WASM upgrade). Polled on EVERY tick, budget or
             // not — see `crawl_river_room` for why that is load-bearing.
             let owner_vk = owner_vk.trim().to_string();
-            captured += crawl_river_room(cli, &owner_vk, &seen, &mut pending, &registry);
+            captured += crawl_river_room(cli, &owner_vk, &suppressed, &mut pending, &registry);
         } else {
             // A curated locator from the operator's own file. Normalized before
             // it is queued, like every other locator: queuing the raw line meant
@@ -989,7 +1689,7 @@ fn run_once(
                 None => (line.to_string(), "external"),
             };
             trusted.insert(loc.clone());
-            if !seen.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR) {
+            if !suppressed.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR) {
                 captured += 1;
             }
         }
@@ -1001,11 +1701,17 @@ fn run_once(
     // just discovered — and if the room evicted those messages meanwhile, they
     // are gone for good. "Safe the moment we see it" has to mean written down
     // the moment we see it.
-    pending.save();
+    // Phase 1's save is what makes a just-released locator durable in the queue.
+    // If it fails, the quarantine must not persist the advanced schedule that
+    // says "already handed over" — otherwise the locator is in neither file.
+    if !pending.save() {
+        anyhow::bail!("pending queue could not be persisted; quarantine left untouched");
+    }
 
     // ---- Phase 2: description. Billed, rationed, and fair. ----
     let mut added = 0usize;
     let mut unresolvable = 0usize;
+    let mut refused = 0usize;
     let mut baselines = AppBaselines::default();
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
@@ -1065,18 +1771,45 @@ fn run_once(
                 seen.insert(loc.clone());
                 append_seen(seen_path, &loc);
                 pending.remove(&loc);
+                // Drop any quarantine entry NOW rather than leaving it for the
+                // next load's seen-purge. `mark_attempted` may have just pushed
+                // its due time weeks out, which would make this — a locator we
+                // just indexed successfully — the furthest-due entry and so the
+                // prime victim of an author-share eviction later in this same
+                // drain, producing a "gave up for good" line for a live site.
+                quarantine.forget(&loc);
             }
-            // Transient: a fetch timeout, a 5xx, an LLM hiccup, a failed
-            // `atlasctl add` because the node was restarting. Keep it queued and
-            // try again on a later run rather than discarding a good link (and
-            // the money already spent describing it) over a blip.
             // A locator whose app the registry does not know is a CONFIGURATION
-            // state, not a bad link: leave it queued, un-penalised, and do not
-            // count an attempt. Otherwise a transient registry read failure
+            // state, not a bad link: leave it queued and do not burn one of its
+            // three retries. Otherwise a transient registry read failure
             // permanently discards every queued app locator after three runs.
-            Err(e) if is_unresolvable_app(&e) || is_deterministic_refusal(&e) => {
+            // (The spend ledger has already been charged for the attempt by
+            // `budget.try_take` above — this arm spares the RETRY counter, not
+            // the budget.)
+            Err(e) if is_unresolvable_app(&e) => {
                 eprintln!("  deferring {loc}: {e}");
                 unresolvable += 1;
+            }
+            // A DETERMINISTIC refusal — too little text to describe or to rate,
+            // or the app served its missing-resource placeholder. Retrying cannot
+            // help today, but the page may gain content later, so it stays queued
+            // and un-penalised. Counted separately from the unresolvable-app case:
+            // reporting both under "their app is not registered" sent a reader
+            // hunting a registry fault that did not exist.
+            Err(e) if is_deterministic_refusal(&e) => {
+                eprintln!("  deferring {loc}: {e}");
+                refused += 1;
+            }
+            // The server asserted the resource does not exist. That IS a
+            // decision, so it is marked seen like any other — no retry cycle, no
+            // quarantine. Retrying a 404 weekly for ever is what turns ordinary
+            // link rot into a budget that never indexes anything new again.
+            Err(e) if is_gone_for_good(&e) => {
+                eprintln!("  {loc} is gone ({e}); not retrying");
+                seen.insert(loc.clone());
+                append_seen(seen_path, &loc);
+                pending.remove(&loc);
+                quarantine.forget(&loc);
             }
             // Transient: a fetch timeout, a 5xx, an LLM hiccup, a failed
             // `atlasctl add` because the node was restarting. Keep it queued and
@@ -1085,16 +1818,47 @@ fn run_once(
             Err(e) => {
                 eprintln!("  skip {loc}: {e:#}");
                 if pending.record_failure(&loc) {
-                    eprintln!("  giving up on {loc} after {MAX_ATTEMPTS} attempts");
-                    seen.insert(loc.clone());
-                    append_seen(seen_path, &loc);
+                    // QUARANTINE, do not mark seen. Failing to REACH a locator is
+                    // not a decision about it, and `crawler-seen.txt` is
+                    // append-only and never re-read for retry — so marking it
+                    // there excluded the site permanently. Held for
+                    // QUARANTINE_SECS, then queued again.
+                    let victim = quarantine.hold(&loc, kind, &author, now_secs());
+                    if victim.as_deref() != Some(loc.as_str()) {
+                        // Only claim a retry when there will be one: when the
+                        // locator IS the victim, the two lines would contradict
+                        // each other and `grep 'will retry'` would report a
+                        // retry that never happens.
+                        eprintln!(
+                            "  quarantining {loc} after {MAX_ATTEMPTS} transient failures \
+                             — will retry in {}d",
+                            QUARANTINE_SECS / 86_400
+                        );
+                    }
+                    if let Some(victim) = victim {
+                        // Holding this one pushed its author over their share.
+                        // The displaced locator leaves as a DECISION — it is
+                        // already out of the pending queue, so dropping it
+                        // silently would put it in no file at all.
+                        eprintln!(
+                            "  giving up on {victim} for good: {author} is at their \
+                             quarantine share"
+                        );
+                        seen.insert(victim.clone());
+                        append_seen(seen_path, &victim);
+                        pending.remove(&victim);
+                    }
                 }
             }
         }
     }
+    // Before `pending.save()`, and fatal if it fails: see `Quarantine::save`.
+    if !quarantine.save() {
+        anyhow::bail!("quarantine could not be persisted; pending queue left untouched");
+    }
     pending.advance_cursor(authors_served.len(), bucket_count);
     pending.report_refusals();
-    pending.save();
+    let _ = pending.save();
 
     if registry.apps.is_empty() {
         eprintln!(
@@ -1103,10 +1867,21 @@ fn run_once(
              behaviour this crawler was changed to fix. Check `atlasctl apps`."
         );
     }
+    // Both lines say "no retry burned", NOT "no budget charged". `budget.try_take`
+    // runs BEFORE `index_locator` and has already appended to the spend ledger by
+    // the time either outcome is known, so these attempts ARE in the "N attempted"
+    // figure below. What these arms spare the locator is its own retry counter, so
+    // it is never quarantined for being thin or for an unregistered app.
     if unresolvable > 0 {
         eprintln!(
             "{unresolvable} locator(s) deferred because their app is not registered \
-             (left queued, no budget charged)"
+             (left queued, no retry burned)"
+        );
+    }
+    if refused > 0 {
+        eprintln!(
+            "{refused} locator(s) deferred as too thin or placeholder \
+             (left queued, no retry burned)"
         );
     }
     let attempts = budget.attempts;
@@ -2765,10 +3540,60 @@ fn blocked_v6(v6: std::net::Ipv6Addr) -> bool {
         || (seg[0] & 0xfe00) == 0xfc00
 }
 
+/// The server said this resource is GONE, not that it had a problem serving it.
+///
+/// Distinguishing these is what keeps the retry cycle finite. Treating a 404 as
+/// transient means a page deleted today is re-fetched on every cycle for as long
+/// as the crawler runs, and ordinary link rot alone is enough to consume the
+/// whole daily budget re-testing links that will never come back.
+#[derive(Debug)]
+struct GoneForGood(reqwest::StatusCode);
+
+impl std::fmt::Display for GoneForGood {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "http {} — the resource is gone, not merely unreachable",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GoneForGood {}
+
+/// True if this status asserts the resource does not exist, as opposed to the
+/// server having trouble serving it.
+///
+/// Deliberately narrow, and the narrowness is the point: everything that lands
+/// here is decided permanently, so a false positive drops a live site for good.
+/// 403 is excluded because it is routinely a bot block or a geo-fence that a
+/// later attempt or a different network gets past; 5xx and 429 are plainly the
+/// server's problem, not the resource's.
+fn is_permanent_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    )
+}
+
+/// True if this error means the resource does not exist, so no retry can help.
+///
+/// Deliberately narrow. 403 is NOT here: it is routinely a bot block or a
+/// geo-fence, which a later attempt or a different network can get past, and
+/// misclassifying it would permanently drop a live site. 5xx and 429 are plainly
+/// transient. That leaves the two statuses that actually assert non-existence.
+fn is_gone_for_good(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<GoneForGood>().is_some())
+}
+
 fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
     let resp = client.get(url).send().with_context(|| "fetch failed")?;
     if !resp.status().is_success() {
-        bail!("http {}", resp.status());
+        let status = resp.status();
+        if is_permanent_status(status) {
+            return Err(anyhow::Error::new(GoneForGood(status)));
+        }
+        bail!("http {status}");
     }
     let mut buf = Vec::new();
     resp.take(MAX_FETCH_BYTES as u64).read_to_end(&mut buf)?;
@@ -3528,7 +4353,7 @@ mod tests {
             let mut p = Pending::load(f.path());
             assert!(p.add("app:delta/AmcVD92D3U", "site", HUB_AUTHOR));
             assert!(p.add("app:delta/DWn4bEFfoo", "site", HUB_AUTHOR));
-            p.save();
+            assert!(p.save());
         }
         let reloaded = Pending::load(f.path());
         assert!(reloaded.contains("app:delta/AmcVD92D3U"));
@@ -4179,7 +5004,7 @@ mod tests {
             let mut p = Pending::load(f.path());
             p.add("https://a.example/1", "external", "ALICE");
             p.add(&format!("freenet:{ID}/x"), "site", "BOB");
-            p.save();
+            assert!(p.save());
         }
         let p = Pending::load(f.path());
         assert_eq!(p.len(), 2);
@@ -4206,6 +5031,1221 @@ mod tests {
             "must give up on the final attempt"
         );
         assert!(!p.contains("https://flaky.example/1"));
+    }
+
+    #[test]
+    fn quarantine_releases_only_when_due() {
+        let f = TmpFile::new("quarantine-cooldown");
+        let at = 1_000_000_000u64;
+        let none: HashSet<String> = HashSet::new();
+        {
+            let (mut q, released, exhausted) = Quarantine::load(f.path(), at, &none);
+            assert!(released.is_empty() && exhausted.is_empty());
+            let _ = q.hold("https://flaky.example/1", "external", "ALICE", at);
+            assert!(q.save());
+        }
+        // One second short of due: still held, nothing released.
+        let (q, released, _) = Quarantine::load(f.path(), at + QUARANTINE_SECS - 1, &none);
+        assert!(released.is_empty(), "must not release before it is due");
+        assert_eq!(
+            q.held().collect::<HashSet<_>>(),
+            HashSet::from(["https://flaky.example/1".to_string()]),
+            "a held locator must suppress capture so discovery cannot re-queue it"
+        );
+
+        // Due: released WITH its queue metadata, and still in the file — the
+        // entry only leaves when it is decided.
+        let (q, released, _) = Quarantine::load(f.path(), at + QUARANTINE_SECS, &none);
+        assert_eq!(
+            released,
+            vec![(
+                0,
+                "https://flaky.example/1".to_string(),
+                "external",
+                "ALICE".to_string()
+            )],
+            "kind and author must round-trip so a room link can be re-queued"
+        );
+        assert_eq!(
+            q.held().count(),
+            1,
+            "a released entry STAYS in the file, so its cycle count is durable \
+             and the size bound can see it"
+        );
+    }
+
+    /// The cost bound. Each retry cycle must push the next one further out, and
+    /// after MAX_QUARANTINE_CYCLES the locator must be decided permanently —
+    /// otherwise every dead link costs MAX_ATTEMPTS billed attempts per cycle
+    /// for ever, and re-testing dead links eventually consumes the whole budget.
+    #[test]
+    fn quarantine_backs_off_and_finally_gives_up_for_good() {
+        let f = TmpFile::new("quarantine-cycles");
+        let none: HashSet<String> = HashSet::new();
+        let loc = "https://dead.example/1";
+        let mut now = 1_000_000_000u64;
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        let _ = q.hold(loc, "external", "ALICE", now);
+        assert!(q.save());
+        // The initial hold schedules the FIRST retry one base cooldown out, so
+        // advance to it before the first cycle.
+        now = due_after(0, now);
+
+        let mut gaps = Vec::new();
+        for cycle in 0..MAX_QUARANTINE_CYCLES {
+            let (mut q, released, exhausted) = Quarantine::load(f.path(), now, &none);
+            assert!(exhausted.is_empty(), "cycle {cycle} must not be terminal");
+            assert_eq!(released.len(), 1, "cycle {cycle} must come due");
+            assert_eq!(released[0].0, cycle, "the cycle count must persist");
+            q.mark_attempted(loc, now);
+            assert!(q.save());
+
+            // The backoff must be pinned against the SCHEDULE THE CODE STORED,
+            // not against the test's own arithmetic. "Not due at `now`" is a
+            // lower bound of ANY positive delay, so it passes even when
+            // mark_attempted stores `now + 1` — which makes a locator due on the
+            // very next run, burns all four cycles in minutes, and blacklists a
+            // live site for good. That is the original bug, with a green suite.
+            // So: assert it is NOT due one second early, and IS due exactly on
+            // time.
+            let next_due = due_after(cycle + 1, now);
+            let (_, early, _) = Quarantine::load(f.path(), next_due - 1, &none);
+            assert!(
+                early.is_empty(),
+                "cycle {cycle} must wait the FULL backoff, not release early"
+            );
+            let (_, on_time, terminal) = Quarantine::load(f.path(), next_due, &none);
+            if cycle + 1 < MAX_QUARANTINE_CYCLES {
+                assert_eq!(
+                    on_time.len(),
+                    1,
+                    "cycle {cycle} must release exactly when its stored due time \
+                     arrives"
+                );
+            } else {
+                // The LAST cycle is truncated on purpose: `load` checks
+                // `cycles >= MAX_QUARANTINE_CYCLES` BEFORE `now >= due_at`, so
+                // the run after the fourth placement gives up rather than
+                // granting a fourth release. That is why the lifetime cost is
+                // ~13 attempts and not 15. Pinned so a future reader who
+                // "fixes" the check order sees it is a decision, not an
+                // accident.
+                assert!(
+                    on_time.is_empty() && terminal == vec![(loc.to_string(), Decided::Exhausted)],
+                    "the final cycle must exhaust rather than release again"
+                );
+            }
+
+            let prev = now;
+            now = next_due;
+            gaps.push(now - prev);
+        }
+
+        assert!(
+            gaps.windows(2).all(|w| w[1] > w[0]),
+            "each cycle must wait longer than the last, got {gaps:?}"
+        );
+
+        // Out of cycles: decided for good, and gone from the file.
+        let (mut q, released, exhausted) = Quarantine::load(f.path(), now, &none);
+        assert!(
+            released.is_empty(),
+            "an exhausted locator is not re-released"
+        );
+        assert_eq!(
+            exhausted,
+            vec![(loc.to_string(), Decided::Exhausted)],
+            "it must be given up for good, and say why"
+        );
+        assert_eq!(q.held().count(), 0);
+        assert!(q.save());
+        let (_, _, twice) = Quarantine::load(f.path(), now, &none);
+        assert!(twice.is_empty(), "and it must not be reported again");
+    }
+
+    /// A release the queue REFUSES must not burn a retry cycle: nothing was
+    /// learned about the locator, only that there was no room for it.
+    #[test]
+    fn a_refused_release_does_not_burn_a_cycle() {
+        let f = TmpFile::new("release-refused-q");
+        let none: HashSet<String> = HashSet::new();
+        let now = 2_000_000_000u64;
+        let loc = "https://refused.example/1".to_string();
+
+        {
+            let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+            let _ = q.hold(&loc, "external", "ALICE", now);
+            assert!(q.save());
+        }
+
+        // Fill ALICE's bucket so the release cannot be placed.
+        let mut pending = Pending::load(TmpFile::new("release-refused-p").path());
+        for i in 0..MAX_PENDING_PER_AUTHOR {
+            pending.add(&format!("https://filler.example/{i}"), "external", "ALICE");
+        }
+
+        let due = now + QUARANTINE_SECS;
+        let (mut q, released, _) = Quarantine::load(f.path(), due, &none);
+        assert_eq!(released.len(), 1);
+        let (requeued, held_back) = requeue_released(released, &none, &mut pending, &mut q, due);
+        assert_eq!(
+            (requeued, held_back),
+            (0, 1),
+            "a full bucket must refuse it"
+        );
+        assert!(
+            !pending.contains(&loc),
+            "test premise: it really was refused"
+        );
+        assert!(q.save());
+
+        // Still held, cycle NOT burned, and due again shortly rather than after
+        // another full cooldown.
+        let (_, soon, _) = Quarantine::load(f.path(), due + REFUSED_RETRY_SECS, &none);
+        assert_eq!(soon.len(), 1, "a refused release must come back");
+        assert_eq!(
+            soon[0].0, 0,
+            "a refusal is not an attempt, so it must not consume a retry cycle"
+        );
+    }
+
+    /// A refusal does not burn a cycle — but an entry the queue can NEVER accept
+    /// must still converge. Without a bound on consecutive deferrals it would
+    /// re-release hourly for ever, never reach the terminal state, hold one of
+    /// its author's slots indefinitely, and — being due soonest — sit at exactly
+    /// the end the trim protects, outliving entries with real retry history.
+    #[test]
+    fn an_unplaceable_locator_still_converges() {
+        let f = TmpFile::new("defer-converge");
+        let none: HashSet<String> = HashSet::new();
+        let loc = "https://unplaceable.example/1";
+        let mut now = 1_000_000u64;
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+
+        // Refused every single time. The LAST refusal is the one that tips it
+        // over, and it stamps the new schedule from the clock at that moment —
+        // not from the clock after the loop, which is an hour later.
+        let mut tipped_at = now;
+        for _ in 0..MAX_CONSECUTIVE_DEFERS {
+            tipped_at = now;
+            q.defer_placement(loc, now);
+            now += REFUSED_RETRY_SECS;
+        }
+        assert!(q.save());
+
+        // The cycle must be burned AND the entry must then back off. Asserting
+        // only the burn leaves the schedule unread, which is how the original
+        // backoff test passed while storing `now + 1`.
+        let (_, early, _) = Quarantine::load(f.path(), due_after(1, tipped_at) - 1, &none);
+        assert!(
+            early.is_empty(),
+            "a defer-triggered cycle must still back off, or an unplaceable entry \
+             burns all four cycles in days instead of months"
+        );
+        let (_, released, _) = Quarantine::load(f.path(), due_after(1, tipped_at), &none);
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(1),
+            "a day of being unplaceable must count as a cycle, or the entry never \
+             reaches the terminal state"
+        );
+    }
+
+    /// `defers` counts CONSECUTIVE refusals, so a successful placement must reset
+    /// it. Without the reset it is cumulative, and a locator that meets a busy
+    /// queue 23 times across its life burns a cycle on the 24th regardless of the
+    /// successful placements in between — converging early, toward the blacklist.
+    #[test]
+    fn a_successful_placement_resets_the_refusal_count() {
+        let f = TmpFile::new("defer-reset");
+        let none: HashSet<String> = HashSet::new();
+        let loc = "https://intermittent.example/1";
+        let mut now = 1_000_000u64;
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        for _ in 0..MAX_CONSECUTIVE_DEFERS - 1 {
+            q.defer_placement(loc, now);
+            now += REFUSED_RETRY_SECS;
+        }
+        // One good placement in between.
+        q.mark_attempted(loc, now);
+        assert!(q.save());
+
+        // One more refusal must NOT tip it over: the counter restarted.
+        q.defer_placement(loc, now);
+        assert!(q.save());
+        let (_, released, _) = Quarantine::load(f.path(), due_after(4, now), &none);
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(1),
+            "a placement must reset the consecutive-refusal count, or refusals \
+             accumulate across a locator's whole life"
+        );
+    }
+
+    /// An undrained queue entry must not count toward the refusal budget either.
+    /// It was ACCEPTED earlier and is merely waiting its turn, so a deep backlog
+    /// must not walk it through all four cycles and blacklist it un-retried.
+    #[test]
+    fn an_undrained_entry_never_burns_a_cycle_however_long_it_waits() {
+        let f = TmpFile::new("undrained-forever");
+        let none: HashSet<String> = HashSet::new();
+        let loc = "https://waiting.example/1";
+        let mut now = 1_000_000u64;
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        for _ in 0..MAX_CONSECUTIVE_DEFERS * 3 {
+            q.defer_undrained(loc, now);
+            now += REFUSED_RETRY_SECS;
+        }
+        assert!(q.save());
+
+        let (_, released, decided) = Quarantine::load(f.path(), now + REFUSED_RETRY_SECS, &none);
+        assert!(decided.is_empty(), "it must never be given up on");
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(0),
+            "waiting in the queue is not a retry, however many times we look"
+        );
+    }
+
+    /// A release the queue ACCEPTS burns a cycle; one already decided about is
+    /// dropped from the file entirely.
+    #[test]
+    fn requeue_released_places_what_it_can_and_forgets_what_is_decided() {
+        let f = TmpFile::new("requeue-ok-q");
+        let now = 1_000u64;
+        let fresh = "https://fresh.example/1".to_string();
+        let decided = "https://decided.example/1".to_string();
+        let none: HashSet<String> = HashSet::new();
+        let seen: HashSet<String> = [decided.clone()].into_iter().collect();
+
+        let mut pending = Pending::load(TmpFile::new("requeue-ok-p").path());
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        let _ = q.hold(&fresh, "external", "ALICE", now);
+        let _ = q.hold(&decided, "external", "ALICE", now);
+
+        let (requeued, held_back) = requeue_released(
+            vec![
+                (0, fresh.clone(), "external", "ALICE".to_string()),
+                (0, decided.clone(), "external", "ALICE".to_string()),
+            ],
+            &seen,
+            &mut pending,
+            &mut q,
+            now,
+        );
+        assert_eq!((requeued, held_back), (1, 0));
+        assert!(
+            pending.contains(&fresh),
+            "a placeable release must be queued"
+        );
+        assert!(
+            !pending.contains(&decided),
+            "an already-decided locator must not be re-queued"
+        );
+        let held: HashSet<String> = q.held().collect();
+        assert!(
+            !held.contains(&decided),
+            "a decided locator must be dropped from the quarantine"
+        );
+        assert!(
+            held.contains(&fresh),
+            "an in-flight one stays until decided"
+        );
+    }
+
+    /// The hold is only meaningful if discovery is actually filtered by it.
+    #[test]
+    fn capture_filter_suppresses_held_but_not_unrelated_locators() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("capfilter-q").path(), 0, &none);
+        let held = "https://held.example/1".to_string();
+        let indexed = "https://indexed.example/1".to_string();
+        let free = "https://free.example/1".to_string();
+        let _ = q.hold(&held, "external", "ALICE", 1_000);
+        let seen: HashSet<String> = [indexed.clone()].into_iter().collect();
+
+        let f = capture_filter(&seen, &q);
+        assert!(f.contains(&held), "a held locator must not be re-captured");
+        assert!(f.contains(&indexed), "seen must still suppress capture");
+        assert!(
+            !f.contains(&free),
+            "an unrelated locator must stay capturable"
+        );
+    }
+
+    /// The bound must hold over EVERY entry, not just the ones still cooling.
+    /// The first version of this type removed due entries at load and re-appended
+    /// refused ones afterwards, so the trim only ever measured the cooling subset
+    /// and the file could grow without limit — with a test that read as if it
+    /// proved the opposite, because its fixture was entirely inside the cooldown.
+    /// WHICH end the trim drops. The bound test gives every entry the same
+    /// due_at, so its sort degenerates to the locator tiebreak and inverting the
+    /// policy still passes. This one gives them distinct due times.
+    #[test]
+    fn the_trim_drops_the_entries_due_furthest_out() {
+        let f = TmpFile::new("quarantine-trim-dir");
+        let now = 9_000_000_000u64;
+        let none: HashSet<String> = HashSet::new();
+        // Half due soon (already past), half due far out. Only the far ones may go.
+        let soon = MAX_QUARANTINE - 20;
+        let body: String = (0..MAX_QUARANTINE + 40)
+            .map(|i| {
+                let due = if i < soon {
+                    now - 1
+                } else {
+                    now + 1_000_000 + i as u64
+                };
+                // Spread across authors so the GLOBAL bound is what this
+                // exercises, not the per-author one.
+                format!(
+                    "{due}\t0\t0\texternal\tA{}\thttps://q.example/{i}\n",
+                    i % 60
+                )
+            })
+            .collect();
+        fs::write(f.path(), body).unwrap();
+
+        let (q, _, decided) = Quarantine::load(f.path(), now, &none);
+        assert_eq!(q.held().count(), MAX_QUARANTINE);
+        assert_eq!(decided.len(), 40);
+        let held: HashSet<String> = q.held().collect();
+        for i in 0..soon {
+            assert!(
+                held.contains(&format!("https://q.example/{i}")),
+                "a soonest-due entry must survive the trim (i={i})"
+            );
+        }
+        for (d, why) in &decided {
+            let i: usize = d.rsplit('/').next().unwrap().parse().unwrap();
+            assert!(
+                i >= soon,
+                "only furthest-due entries may be dropped, got {d}"
+            );
+            assert_eq!(
+                *why,
+                Decided::OverCapacity,
+                "a capacity eviction must not be reported as retry exhaustion"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_bound_covers_entries_that_are_already_due() {
+        let f = TmpFile::new("quarantine-trim-due");
+        let now = 9_000_000_000u64;
+        let none: HashSet<String> = HashSet::new();
+        // EVERY entry already due, which is exactly the population the old trim
+        // could not see.
+        let body: String = (0..MAX_QUARANTINE + 50)
+            .map(|i| {
+                // Spread across authors so the GLOBAL bound is what this
+                // exercises, not the per-author one.
+                format!(
+                    "{}\t0\t0\texternal\tA{}\thttps://q.example/{i}\n",
+                    now - 1,
+                    i % 60
+                )
+            })
+            .collect();
+        fs::write(f.path(), body).unwrap();
+
+        let (q, released, decided) = Quarantine::load(f.path(), now, &none);
+        assert_eq!(
+            q.held().count(),
+            MAX_QUARANTINE,
+            "the file must be bounded even when every entry is due"
+        );
+        assert!(
+            released.len() <= MAX_QUARANTINE,
+            "a trimmed entry must not still be handed to the queue"
+        );
+        // A trimmed entry is already out of the pending queue, so it must leave
+        // as a DECISION. Dropping it silently puts it in no file at all.
+        assert_eq!(
+            decided.len(),
+            50,
+            "every trimmed locator must be handed back to be marked seen"
+        );
+        for (loc, why) in &decided {
+            assert!(
+                !q.held().any(|h| &h == loc),
+                "a decided locator must not also still be held"
+            );
+            assert_eq!(*why, Decided::OverCapacity);
+        }
+        for (_, loc, _, _) in &released {
+            assert!(
+                q.held().any(|h| &h == loc),
+                "every released locator must still be in the file, or its cycle \
+                 count is lost"
+            );
+        }
+    }
+
+    /// One author must not be able to occupy the whole quarantine, or Pending's
+    /// per-author cap is defeated one level down and a single room member owns
+    /// the recurring retry budget.
+    /// An author carrying a field separator would let one quarantine entry forge
+    /// another on the next read. Rejecting is right (sanitising would silently
+    /// move the locator to a different rate-limit bucket) — but the locator must
+    /// still leave as a decision rather than evaporating.
+    #[test]
+    fn hold_refuses_a_separator_bearing_author_without_losing_the_locator() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("hold-sep").path(), 0, &none);
+        let loc = "https://a.example/1";
+        let victim = q.hold(loc, "external", "AL\tICE", 1_000);
+        assert_eq!(
+            victim.as_deref(),
+            Some(loc),
+            "the locator must be handed back to be decided, not dropped"
+        );
+        assert_eq!(
+            q.held().count(),
+            0,
+            "and must not be stored under a forged author"
+        );
+    }
+
+    /// The per-author cap must be enforced on LOAD as well as in `hold`. This is
+    /// the failure `Pending::load` documents in this same file: `hold` evicts
+    /// exactly one entry per insertion, so a bucket that arrives oversized — a
+    /// hand-edit, or a later lowering of the constant — adds one and removes one
+    /// for ever and never trims back down.
+    #[test]
+    fn an_oversized_author_bucket_is_trimmed_on_load() {
+        let f = TmpFile::new("author-load-cap");
+        let none: HashSet<String> = HashSet::new();
+        let now = 9_000_000_000u64;
+        let body: String = (0..MAX_PENDING_PER_AUTHOR + 50)
+            .map(|i| {
+                format!(
+                    "{}\t0\t0\texternal\tSPAMMER\thttps://s.example/{i:04}\n",
+                    now + 1_000 + i as u64
+                )
+            })
+            .collect();
+        fs::write(f.path(), body).unwrap();
+
+        let (q, _, decided) = Quarantine::load(f.path(), now, &none);
+        assert_eq!(
+            q.held().count(),
+            MAX_PENDING_PER_AUTHOR,
+            "an oversized bucket must be trimmed on load, not carried whole"
+        );
+        assert_eq!(decided.len(), 50, "and the excess must leave as decisions");
+        for (_, why) in &decided {
+            assert_eq!(
+                *why,
+                Decided::OverAuthorShare,
+                "an author-share eviction must not be reported as the FILE hitting \
+                 its limit — that sends an operator to check the wrong thing"
+            );
+        }
+    }
+
+    /// The already-queued path must go through `defer_undrained`, not
+    /// `defer_placement`. Routing it into the refusal counter means a deep
+    /// backlog walks a perfectly good locator through all four cycles and
+    /// blacklists it without a single re-attempt — which is precisely what that
+    /// branch's comment says must not happen.
+    #[test]
+    fn a_long_backlog_never_exhausts_an_undrained_locator() {
+        let f = TmpFile::new("backlog-undrained");
+        let none: HashSet<String> = HashSet::new();
+        let loc = "https://queued.example/1".to_string();
+        let mut now = 1_000_000u64;
+
+        let mut pending = Pending::load(TmpFile::new("backlog-p").path());
+        pending.add(&loc, "external", "ALICE");
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        assert!(q.hold(&loc, "external", "ALICE", now).is_none());
+        assert!(q.save());
+
+        // Far more looks than the refusal budget, always finding it still queued.
+        for _ in 0..MAX_CONSECUTIVE_DEFERS * 2 {
+            now += QUARANTINE_SECS;
+            let (mut q, released, decided) = Quarantine::load(f.path(), now, &none);
+            assert!(decided.is_empty(), "it must never be given up on");
+            if !released.is_empty() {
+                requeue_released(released, &none, &mut pending, &mut q, now);
+            }
+            assert!(q.save());
+        }
+
+        let (_, released, _) = Quarantine::load(f.path(), now + QUARANTINE_SECS * 4, &none);
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(0),
+            "waiting in the queue is not a retry, however long the backlog lasts"
+        );
+    }
+
+    /// An older on-disk line must UPGRADE, not be discarded. The format has
+    /// already changed twice; after this ships the file holds real durable state,
+    /// and a third change without this would wipe it while reporting "no longer
+    /// validate" — misattributing a schema change as a validation failure.
+    #[test]
+    fn older_quarantine_line_formats_upgrade_in_place() {
+        let none: HashSet<String> = HashSet::new();
+        let now = 1_785_000_000u64;
+        let due = now - 1;
+
+        // 4-field (due, kind, author, locator) and 5-field (adds cycles), the two
+        // shapes this branch wrote before the current one.
+        for (label, line) in [
+            (
+                "4-field",
+                format!("{due}\texternal\tALICE\thttps://old.example/1\n"),
+            ),
+            (
+                "5-field",
+                format!("{due}\t2\texternal\tALICE\thttps://old.example/1\n"),
+            ),
+        ] {
+            let f = TmpFile::new("quarantine-upgrade");
+            fs::write(f.path(), &line).unwrap();
+            let (mut q, released, decided) = Quarantine::load(f.path(), now, &none);
+            assert!(decided.is_empty(), "{label} must not be given up on");
+            assert_eq!(
+                released.len(),
+                1,
+                "{label} must be read, not discarded as invalid"
+            );
+            assert_eq!(
+                q.held().count(),
+                1,
+                "{label} must be retained in the quarantine"
+            );
+            // And it must be rewritten in the current shape.
+            assert!(q.save());
+            let back = fs::read_to_string(f.path()).unwrap();
+            assert_eq!(
+                back.trim_end().split('\t').count(),
+                6,
+                "{label} must be upgraded on disk, not left in the old shape"
+            );
+        }
+    }
+
+    /// A capacity eviction must not be reported as retry exhaustion. The
+    /// per-locator "giving up on X" line is the greppable forensic record that
+    /// replaces the undifferentiated seen file, so telling an operator a link
+    /// burned all its retry cycles when it actually lost a capacity contest on
+    /// its first day sends them to exactly the wrong conclusion.
+    #[test]
+    fn the_reason_a_locator_was_given_up_on_is_recorded_accurately() {
+        assert_ne!(
+            Decided::Exhausted.why(),
+            Decided::OverCapacity.why(),
+            "the two must not share a message"
+        );
+        assert!(
+            Decided::OverCapacity.why().contains("NOT retry exhaustion"),
+            "a capacity eviction must say so explicitly"
+        );
+        // A per-author eviction is NOT a global-capacity one: saying so sends an
+        // operator to check the file size when the cause was one author's share.
+        assert_ne!(
+            Decided::OverAuthorShare.why(),
+            Decided::OverCapacity.why(),
+            "the two capacity reasons must be distinguishable"
+        );
+        assert!(
+            Decided::OverAuthorShare.why().contains("author"),
+            "an author-share eviction must name the author's share as the cause"
+        );
+        assert!(
+            Decided::Exhausted.why().contains("retry cycles"),
+            "genuine exhaustion must still name the cycles"
+        );
+    }
+
+    /// A locator refused by the author-share cap must leave as a DECISION, never
+    /// as a silent drop. By the time hold() runs, record_failure has already
+    /// removed it from the pending queue, so dropping it puts it in no file at
+    /// all — the exact loss this type exists to remove, one level down.
+    #[test]
+    fn the_author_share_cap_yields_a_victim_instead_of_dropping() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("author-victim").path(), 0, &none);
+        let mut victims = Vec::new();
+        for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
+            // Staggered hold times, so the victim rule is genuinely exercised:
+            // with one uniform due time the max_by degenerates to the locator
+            // STRING tiebreak and min_by would pass too.
+            //
+            // Deliberately NOT zero-padded. Padding would make the string order
+            // agree with the due-time order, so a mutation selecting on the
+            // locator alone would pick the same victims and pass. Unpadded, the
+            // lexicographic max of "0".."249" is "99", so that mutation evicts
+            // low-numbered entries and the survivor loop below catches it.
+            if let Some(v) = q.hold(
+                &format!("https://s.example/{i}"),
+                "external",
+                "SPAMMER",
+                1_000 + i as u64 * 60,
+            ) {
+                victims.push(v);
+            }
+        }
+        assert_eq!(
+            victims.len(),
+            50,
+            "every locator over the share must be handed back to be decided, not \
+             dropped: {} held + {} victims must account for all {} offered",
+            q.held().count(),
+            victims.len(),
+            MAX_PENDING_PER_AUTHOR + 50
+        );
+        let held: HashSet<String> = q.held().collect();
+        let accounted: HashSet<String> = held
+            .union(&victims.iter().cloned().collect())
+            .cloned()
+            .collect();
+        assert_eq!(
+            accounted.len(),
+            MAX_PENDING_PER_AUTHOR + 50,
+            "no locator may be unaccounted for"
+        );
+        // And it must be the FURTHEST-due that goes. Every victim was held later
+        // than every survivor, so under the intended rule the survivors are the
+        // earliest holds.
+        for i in 0..MAX_PENDING_PER_AUTHOR {
+            assert!(
+                held.contains(&format!("https://s.example/{i}")),
+                "the soonest-due entries must survive (i={i})"
+            );
+        }
+    }
+
+    /// Re-holding a locator ALREADY in the quarantine must not reset its
+    /// schedule. Without the guard a give-up on an already-held locator
+    /// overwrites it at cycles=0, so the counter never advances past 1 and the
+    /// terminal state is never reached — the unbounded cost, restored. This is
+    /// the realistic sequence: released, placed, fails its three attempts again,
+    /// held again.
+    #[test]
+    fn re_holding_does_not_reset_the_cycle_count() {
+        let none: HashSet<String> = HashSet::new();
+        let f = TmpFile::new("rehold");
+        let (mut q, _, _) = Quarantine::load(f.path(), 0, &none);
+        let loc = "https://flaky.example/1";
+        let now = 1_000_000u64;
+
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        q.mark_attempted(loc, now);
+        q.mark_attempted(loc, now);
+
+        // A second give-up on the same locator.
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+
+        assert!(q.save());
+        let (_, released, _) = Quarantine::load(f.path(), due_after(2, now), &none);
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(2),
+            "re-holding must keep the accumulated cycles, or there is no terminal state"
+        );
+    }
+
+    /// A curated locator is an explicit operator decision and is exempt from the
+    /// share cap.
+    #[test]
+    fn the_author_share_cap_exempts_curated_locators() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("author-curated").path(), 0, &none);
+        for i in 0..MAX_PENDING_PER_AUTHOR + 10 {
+            assert!(
+                q.hold(
+                    &format!("https://c.example/{i}"),
+                    "external",
+                    CURATED_AUTHOR,
+                    1_000
+                )
+                .is_none(),
+                "a curated locator must never be displaced"
+            );
+        }
+        assert_eq!(q.held().count(), MAX_PENDING_PER_AUTHOR + 10);
+    }
+
+    /// A locator already sitting in the queue from an earlier run must NOT burn a
+    /// retry cycle. Nothing was learned about it — it simply has not come up in
+    /// the drain order — and burning one lets a backlogged queue exhaust all four
+    /// cycles without ever re-attempting it, then blacklist it for good.
+    #[test]
+    fn an_undrained_queue_entry_does_not_burn_a_cycle() {
+        let f = TmpFile::new("undrained-q");
+        let none: HashSet<String> = HashSet::new();
+        let now = 1_000_000u64;
+        let loc = "https://queued.example/1".to_string();
+
+        let mut pending = Pending::load(TmpFile::new("undrained-p").path());
+        pending.add(&loc, "external", "ALICE");
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        let _ = q.hold(&loc, "external", "ALICE", now);
+        assert!(q.save());
+
+        let due = now + QUARANTINE_SECS;
+        let (mut q, released, _) = Quarantine::load(f.path(), due, &none);
+        assert_eq!(released.len(), 1);
+        let (requeued, _) = requeue_released(released, &none, &mut pending, &mut q, due);
+        assert_eq!(requeued, 1, "it is in the queue, so it counts as placed");
+        assert!(q.save());
+
+        let (_, again, _) = Quarantine::load(f.path(), due + REFUSED_RETRY_SECS, &none);
+        assert_eq!(
+            again.len(),
+            1,
+            "it must come back rather than being stuck behind a full cooldown"
+        );
+        assert_eq!(
+            again[0].0, 0,
+            "sitting undrained in the queue is not an attempt, so it must not \
+             consume a retry cycle"
+        );
+    }
+
+    /// A cycle count above the maximum is definitionally corrupt — mark_attempted
+    /// can never write one. It must fail OPEN like every other parse in this
+    /// file, not straight into a permanent blacklist.
+    #[test]
+    fn a_corrupt_cycle_count_does_not_blacklist() {
+        let f = TmpFile::new("quarantine-badcycles");
+        let none: HashSet<String> = HashSet::new();
+        fs::write(f.path(), "0\t99\t0\texternal\tALICE\thttps://a.example/1\n").unwrap();
+        let (q, released, decided) = Quarantine::load(f.path(), 1_785_000_000, &none);
+        assert!(
+            decided.is_empty(),
+            "a corrupt cycle count must not be read as exhausted"
+        );
+        assert_eq!(released.len(), 1, "it must be retried, not given up on");
+        assert_eq!(q.held().count(), 1);
+    }
+
+    #[test]
+    fn quarantine_bounds_one_authors_share() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("quarantine-author").path(), 0, &none);
+        for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
+            let _ = q.hold(
+                &format!("https://s.example/{i}"),
+                "external",
+                "SPAMMER",
+                1_000,
+            );
+        }
+        assert_eq!(
+            q.held().count(),
+            MAX_PENDING_PER_AUTHOR,
+            "one author's quarantine share must be capped"
+        );
+    }
+
+    /// A far-future due time must not strand the locator. It would otherwise sit
+    /// in the capture filter, invisible to discovery, for as long as the skew —
+    /// the permanent exclusion this type exists to remove, reachable by a
+    /// container that ran before its clock synced.
+    #[test]
+    fn quarantine_future_due_time_does_not_strand_the_locator() {
+        let f = TmpFile::new("quarantine-future");
+        let now = 1_785_000_000u64;
+        let none: HashSet<String> = HashSet::new();
+        fs::write(
+            f.path(),
+            format!(
+                "{}\t0\t0\texternal\tALICE\thttps://a.example/1\n",
+                now + 3_000_000_000u64
+            ),
+        )
+        .unwrap();
+
+        let (mut q, released, _) = Quarantine::load(f.path(), now, &none);
+        assert!(released.is_empty(), "clamped, not released instantly");
+        assert_eq!(q.held().count(), 1, "it is held, not lost");
+        // The clamp must be PERSISTED, or every later load re-clamps to that
+        // load's own `now` and the due time never arrives.
+        assert!(q.save());
+
+        let ceiling = due_after(MAX_QUARANTINE_CYCLES, now);
+        let (_, later, _) = Quarantine::load(f.path(), ceiling, &none);
+        assert_eq!(
+            later.len(),
+            1,
+            "a future due time must not hold the locator indefinitely"
+        );
+    }
+
+    /// THE regression pin. The bug was never in `Quarantine` itself — it was in
+    /// what the give-up branch of `run_once` DOES, which no unit test can reach
+    /// (it needs a node, a gateway and an LLM). So this asserts on the source of
+    /// that branch directly: a transient give-up must quarantine, and must NOT
+    /// write to the append-only seen file, because nothing ever re-reads that for
+    /// retry. That is how `Pyvdo1wUC1PG…` — still serving HTTP 200 today — was
+    /// excluded from the index for good by three HTTP 500s.
+    ///
+    /// Scoped to the source BEFORE `mod tests` so the needles cannot match this
+    /// test's own text, and COMMENT-STRIPPED so prose cannot satisfy them: a
+    /// refactor that moved the call into a helper and left "// calls
+    /// quarantine.hold(…)" behind would otherwise keep the pin green.
+    #[test]
+    fn the_give_up_branch_quarantines_and_does_not_blacklist() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn the_give_up_branch_quarantines"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+
+        // Every write to the append-only seen file, ANYWHERE in the crawler.
+        // Scoping this to one branch let the blacklist come back through a
+        // helper. Today: the definition, the `Ok` arm (genuinely decided), the
+        // gone-for-good arm (the server says it does not exist), and the
+        // exhausted-cycles loop (out of retries). A FIFTH is a blacklist
+        // returning by another name.
+        //
+        // Counted on both the stripped and raw source: stripping at `//` also
+        // truncates at a `https://` in a string literal, which could hide a call
+        // rather than only ignore a comment. Requiring both to agree means
+        // stripping can never remove a real match.
+        let stripped = strip_comments(production);
+        assert_eq!(
+            stripped.matches("append_seen(").count(),
+            5,
+            "only the decided paths may write to the permanent seen file: the \
+             definition, the Ok arm, the gone-for-good arm, the out-of-cycles \
+             loop, and the author-share eviction victim"
+        );
+        assert_eq!(
+            production.matches("append_seen(").count(),
+            5,
+            "stripping comments must not have hidden a call site"
+        );
+        // The Ok arm must release the quarantine entry. Without it a locator we
+        // just indexed keeps an entry whose due time `mark_attempted` may have
+        // pushed weeks out, making it the furthest-due — and so the prime victim
+        // of an author-share eviction later in the SAME drain, which then logs
+        // "gave up for good" for a live, freshly-indexed site.
+        let ok_at = production
+            .find("Ok(indexed) => {")
+            .expect("the indexed arm must still exist");
+        let ok_body_start = ok_at + "Ok(indexed) =>".len();
+        let mut depth = 0usize;
+        let mut ok_end = ok_body_start;
+        for (i, c) in production[ok_body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("the Ok arm's body must start at its opening brace");
+                    if depth == 0 {
+                        ok_end = ok_body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            strip_comments(&production[ok_body_start..ok_end]).contains("quarantine.forget("),
+            "an indexed locator must release its quarantine entry immediately, or \
+             it can be evicted as though we had given up on it"
+        );
+
+        assert!(
+            production.contains("if !pending.save() {"),
+            "phase 1's pending save must be CHECKED: it is what makes a released \
+             locator durable, and the quarantine must not record the release if \
+             it failed"
+        );
+        assert!(
+            production.contains("!quarantine.save()"),
+            "the quarantine must be persisted and the failure checked, or a \
+             give-up is lost from pending, quarantine and seen alike"
+        );
+
+        let anchor = "if pending.record_failure(&loc) {";
+        let at = production
+            .find(anchor)
+            .expect("the give-up branch must still exist and be reached via record_failure");
+        // Exactly the branch body, by brace matching. A fixed-size window is the
+        // wrong tool: too small and the pin fails on a comment edit, too large
+        // and it silently starts reading neighbouring code.
+        let body_start = at + anchor.len() - 1;
+        let mut depth = 0usize;
+        let mut end = body_start;
+        for (i, c) in production[body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("anchor must end at the opening brace of the branch");
+                    if depth == 0 {
+                        end = body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            end > body_start,
+            "the give-up branch must be brace-balanced"
+        );
+        let branch = strip_comments(&production[body_start..end]);
+
+        assert!(
+            branch.contains("quarantine.hold("),
+            "a transient give-up must quarantine the locator for a later retry"
+        );
+        // THIS locator must not be marked seen. The branch may mark a DIFFERENT
+        // one — `hold` returns a locator displaced by its author's share, which
+        // is already out of the pending queue and so has to leave as a decision
+        // rather than be dropped into no file at all. So the needles name `loc`
+        // specifically rather than banning the call outright.
+        assert!(
+            !branch.contains("append_seen(seen_path, &loc)") && !branch.contains("seen.insert(loc"),
+            "a transient give-up must NOT write ITS OWN locator to the permanent \
+             seen file — it is never re-read for retry, so that loses the site \
+             for good"
+        );
+        assert!(
+            branch.contains("append_seen(seen_path, &victim)"),
+            "a locator displaced by the author-share cap must leave as a decision; \
+             dropping it silently puts it in no file at all"
+        );
+
+        // The give-up branch is the TRANSIENT catch-all of the
+        // `match index_locator(…)`. The hazard is a BROAD guarded arm inserted
+        // ABOVE it — an `Err(e) if is_retryable(&e)` that happens to match
+        // everything — which makes give-up dead code while every needle above
+        // still matches. (An arm BELOW the catch-all is unreachable and the
+        // compiler says so, which is why counting the arms above is the check
+        // that carries the property. An earlier version of this assertion
+        // scanned the catch-all's own body, where a match arm cannot appear: it
+        // had no failing input at all.)
+        let match_start = production[..at]
+            .rfind("match index_locator(")
+            .expect("the give-up branch must sit in the index_locator match");
+        let arm = production[match_start..at].rfind("Err(e) =>").expect(
+            "the give-up branch must sit in the unguarded catch-all Err arm, not a \
+             guarded one",
+        );
+        assert_eq!(
+            production[match_start..match_start + arm]
+                .matches("Err(e) if ")
+                .count(),
+            3,
+            "exactly three guarded Err arms may precede the transient catch-all \
+             (unresolvable app, deterministic refusal, gone-for-good); a new one \
+             can shadow every transient error and make give-up dead code"
+        );
+    }
+
+    /// The source pins must still exist.
+    ///
+    /// Deliberately a SEPARATE test. An assertion of this kind placed inside the
+    /// pin it names is deleted in the same edit as the pin, so it fires only on a
+    /// rename — which is not the failure that actually happened: the give-up pin
+    /// was accidentally deleted during a rewrite of this module and restored only
+    /// because someone grepped for it. Living out here, a deleter has to remove
+    /// two independent functions.
+    ///
+    /// Still circular (delete this too and it goes), so be precise about what it
+    /// buys: it raises an ACCIDENTAL deletion to a deliberate one. It is not a
+    /// guarantee.
+    #[test]
+    fn the_source_pins_are_all_present() {
+        let src = include_str!("main.rs");
+        for pin in [
+            "fn the_give_up_branch_quarantines_and_does_not_blacklist",
+            "fn strip_comments",
+        ] {
+            // COUNT, not `contains`. Each name appears twice in a healthy file:
+            // the definition, and the literal in this list. A bare `contains`
+            // is satisfied by this list's own text, so it stays green after the
+            // pin is deleted — the self-match trap, and exactly the failure this
+            // test exists to catch.
+            assert_eq!(
+                src.matches(pin).count(),
+                2,
+                "{pin} must exist (found only this list's own mention of it)"
+            );
+        }
+    }
+
+    /// Strip `//` line comments so a source pin cannot be satisfied by prose.
+    fn strip_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A resource the server says is GONE must be decided once, not retried on
+    /// every cycle for ever. Ordinary link rot is enough to drive the retry
+    /// budget to saturation if 404s enter the cycle.
+    #[test]
+    fn only_nonexistence_statuses_are_permanent() {
+        use reqwest::StatusCode;
+        for s in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            assert!(is_permanent_status(s), "{s} asserts the resource is gone");
+        }
+        for s in [
+            StatusCode::FORBIDDEN,
+            // Reads like a permanent decision, but is jurisdiction-scoped: a
+            // different network or exit reaches it. The likeliest wrong addition.
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::UNAUTHORIZED,
+        ] {
+            assert!(
+                !is_permanent_status(s),
+                "{s} is the server's problem, not the resource's — retrying can \
+                 help, and deciding it permanently drops a live site"
+            );
+        }
+        assert!(
+            is_gone_for_good(&anyhow::Error::new(GoneForGood(StatusCode::NOT_FOUND))),
+            "the error must be recognisable through the anyhow chain"
+        );
+        assert!(
+            !is_gone_for_good(&anyhow::anyhow!("http 500 Internal Server Error")),
+            "a plain transient error must not read as gone"
+        );
+    }
+
+    #[test]
+    fn quarantine_drops_entries_that_no_longer_validate() {
+        let f = TmpFile::new("quarantine-revalidate");
+        let none: HashSet<String> = HashSet::new();
+        fs::write(f.path(), "0\t0\t0\tsite\tALICE\tfreenet:not-a-valid-id/x\n").unwrap();
+        let (q, released, _) = Quarantine::load(f.path(), QUARANTINE_SECS + 1, &none);
+        assert!(
+            released.is_empty(),
+            "an invalid locator must not be released"
+        );
+        assert_eq!(q.held().count(), 0);
+    }
+
+    /// A locator that has since been DECIDED about must not linger here. Left in
+    /// place it keeps suppressing its own re-capture through the capture filter,
+    /// and it counts against both the size bound and its author's share.
+    #[test]
+    fn quarantine_purges_locators_already_decided() {
+        let f = TmpFile::new("quarantine-purge");
+        let loc = "https://decided.example/1".to_string();
+        fs::write(f.path(), format!("0\t0\t0\texternal\tALICE\t{loc}\n")).unwrap();
+
+        let none: HashSet<String> = HashSet::new();
+        let (q, released, _) = Quarantine::load(f.path(), 1_785_000_000, &none);
+        assert_eq!(
+            (q.held().count(), released.len()),
+            (1, 1),
+            "test premise: it is held and due when NOT in seen"
+        );
+
+        let seen: HashSet<String> = [loc.clone()].into_iter().collect();
+        let (mut q, released, exhausted) = Quarantine::load(f.path(), 1_785_000_000, &seen);
+        assert!(
+            q.held().count() == 0 && released.is_empty() && exhausted.is_empty(),
+            "a decided locator must be dropped from the quarantine entirely"
+        );
+        // The purge must be PERSISTED. This is the one drop path whose growth is
+        // unbounded in principle — every locator ever quarantined-then-decided
+        // would leave a line behind — so without the dirty flag the file never
+        // shrinks and each stale entry keeps consuming a slot and an author share.
+        assert!(q.save());
+        let reloaded = fs::read_to_string(f.path()).unwrap();
+        assert!(
+            !reloaded.contains(&loc),
+            "the purge must be written, not recomputed on every load"
+        );
+    }
+
+    /// `author` is the one field taken verbatim from disk and is also a
+    /// rate-limit bucket key. A newline in it would let one entry forge another.
+    #[test]
+    fn quarantine_rejects_separator_bearing_authors() {
+        let f = TmpFile::new("quarantine-inject");
+        let none: HashSet<String> = HashSet::new();
+        let mut q = Quarantine {
+            path: f.path().to_path_buf(),
+            entries: HashMap::new(),
+            dirty: true,
+        };
+        q.entries.insert(
+            "https://a.example/1".to_string(),
+            QuarantineEntry {
+                due_at: 0,
+                cycles: 0,
+                defers: 0,
+                kind: "external",
+                author: "X\n99999999999\t0\texternal\tY\thttps://forged.example/".to_string(),
+            },
+        );
+        assert!(q.save());
+        let (q, _, _) = Quarantine::load(f.path(), 1_785_000_000, &none);
+        assert!(
+            !q.held().any(|l| l.contains("forged")),
+            "a forged line must not become a real entry"
+        );
+    }
+
+    #[test]
+    fn quarantine_unparseable_due_time_fails_open() {
+        let f = TmpFile::new("quarantine-badts");
+        let none: HashSet<String> = HashSet::new();
+        fs::write(
+            f.path(),
+            "not-a-number\t0\t0\texternal\tALICE\thttps://a.example/1\n",
+        )
+        .unwrap();
+        let (_, released, _) = Quarantine::load(f.path(), 1_785_000_000, &none);
+        assert_eq!(
+            released.len(),
+            1,
+            "a corrupt due time must release the link, not strand it forever"
+        );
+    }
+
+    /// An unwritable quarantine must REPORT failure, so `run_once` can abandon
+    /// the run before `pending.save()` records the removal of locators whose new
+    /// home was never written.
+    #[test]
+    fn quarantine_write_failure_is_reported() {
+        let bad = PathBuf::from("/proc/atlas-crawler-nonexistent/quarantine.txt");
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, released, _) = Quarantine::load(&bad, 1_785_000_000, &none);
+        assert!(released.is_empty(), "an unreadable file releases nothing");
+        let _ = q.hold("https://a.example/1", "external", "ALICE", 1_785_000_000);
+        assert!(
+            !q.save(),
+            "a failed write must be reported, not swallowed as a warning"
+        );
     }
 
     #[test]
@@ -4238,7 +6278,7 @@ mod tests {
                     );
                 }
             }
-            p.save();
+            assert!(p.save());
         }
         // Each "run" can only afford 3 authors' worth of leading slots.
         let budget_per_run = 3;
@@ -4252,7 +6292,7 @@ mod tests {
                 ever_served.insert(author);
             }
             p.advance_cursor(served.len(), authors);
-            p.save();
+            assert!(p.save());
         }
         assert_eq!(
             ever_served.len(),
