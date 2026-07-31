@@ -7,10 +7,15 @@
 // Usage:  node render.js <shellUrl> [--shot <pngPath>]
 // Output (stdout, one JSON object):
 //   { "ok": true, "status": <httpStatus>, "url": <frameUrl>, "html": ..., "text": ... }
-//   { "ok": true, "status": ..., "pages": [ { hash, html }, ... ] }   (--enumerate)
+//   { "ok": true, "status": ..., "pages": [ { hash, html, text }, ... ] }  (--enumerate)
 //   ...plus "partial": true when a watchdog timeout cut enumeration short.
-// Extra pages carry no `text`: the caller mines them for LINKS only, and a full
-// innerText per page doubled the output against RENDER_MAX_BYTES for nothing.
+// Every page carries BOTH: `html` is mined for links, and `text` is the content
+// region, which the caller needs to DESCRIBE a site. An app-hosted site is one
+// locator with several pages, so describing it from the entry page alone judged a
+// site on whatever its landing route happened to be — usually the app's default
+// stub. Do not drop `text` to save output bytes: it is the content region, far
+// smaller than the `html` on the same page, and removing it silently restores that
+// bug (a site whose content is one page over goes back to reading as too thin).
 //   { "ok": false, "error": <message> }
 //
 // `status` is the top-level HTTP status. The caller MUST reject a non-2xx render:
@@ -50,6 +55,10 @@ const POLL_STEP_MS = 1000;
 const HASH_SETTLE_MS = 2500; // re-render after a hashchange (no reload, no reconnect)
 const ENUM_RESERVE_MS = 8000;  // leave room to close the browser and emit
 const WATCHDOG_MS = 55000; // absolute backstop so we never hang the crawler
+// Process start, so every deadline below is measured against the SAME origin the
+// watchdog uses. A deadline computed later in the run silently grants itself a full
+// fresh budget from that point.
+const startedAt = Date.now();
 
 // Write the JSON result and exit only once stdout has fully drained. Calling
 // process.exit() immediately after a large write truncates output at the OS
@@ -208,8 +217,10 @@ async function pickFrame(page) {
     // hashchange, not a navigation, so the app keeps its connection and state.
     if (enumResource && enumMax > 0) {
       const entryHash = await frame.evaluate(() => location.hash).catch(() => '');
-      const pages = [{ hash: entryHash, html }];
-      const seenHashes = new Set([entryHash]);
+      const pages = [{ hash: entryHash, html, text }];
+      const seenHashes = new Set();
+      let entryRevisits = 0;
+      let truncated = false;
       captured = { status, url: frame.url(), html, text, pages };
       // From 1, not 2: the entry URL is whatever the sources file named, which need
       // not be page 1 — starting at 2 meant page 1 was never enumerated (and the
@@ -220,13 +231,18 @@ async function pickFrame(page) {
       // count alone does not bound time: a 12-page walk is ~30s of hashing on top
       // of a first load that can itself take 30s, and overshooting the watchdog
       // used to lose everything.
-      const stopBy = Date.now() + WATCHDOG_MS - ENUM_RESERVE_MS;
+      // Measured from process START, not from here. Computing it after the first
+      // load granted a fresh full reserve from whatever time it already was, so a
+      // 30s load put the loop's own deadline past the watchdog and ENUM_RESERVE_MS
+      // stopped bounding anything — the watchdog became the real terminator, which
+      // is the path that emits nothing but a timeout.
+      const stopBy = startedAt + WATCHDOG_MS - ENUM_RESERVE_MS;
       for (let i = 1; i <= enumMax; i++) {
-        if (Date.now() > stopBy) break;
+        if (Date.now() > stopBy) { truncated = true; break; }
         const f = await pickFrame(page);
         try {
           await f.evaluate((h) => { window.location.hash = h; }, `#${enumResource}/${i}`);
-        } catch (_) { break; }
+        } catch (_) { truncated = true; break; }
         await page.waitForTimeout(HASH_SETTLE_MS);
         const f2 = await pickFrame(page);
         const got = await f2
@@ -235,18 +251,41 @@ async function pickFrame(page) {
             html: document.documentElement.outerHTML,
           }))
           .catch(() => null);
-        if (!got) break;
-        // The app ran out of pages: it either stopped moving or re-served a page we
-        // already have. Without this, a 3-page site spent most of the remaining
-        // watchdog re-capturing identical DOMs and pushing them toward the output
-        // cap, then fed the same HTML to link extraction nine times.
+        if (!got) { truncated = true; break; }
+        // Content-region text per page, extracted the same way as the entry page.
+        // The caller needs this to DESCRIBE a multi-page site: stripping the raw
+        // HTML instead would pull in the app's chrome, which is the contamination
+        // `--require-content` exists to prevent.
+        got.text = await contentText(f2);
+        // Walking back onto the ENTRY page is not "out of pages". The entry is
+        // whatever the sources file named, so a walk that starts at #res/3 passes
+        // through its own entry on step 3 — breaking there lost pages 4..N for
+        // every locator that named anything but page 1. Skip it instead, since it
+        // is already pages[0]. Only ONCE, though: an app that ignores hash changes
+        // entirely lands here every step, and it should stop rather than spend the
+        // settle delay on each remaining one.
+        if (got.hash === entryHash) {
+          if (entryRevisits++) break;
+          continue;
+        }
+        // The app ran out of pages: it re-served one we already captured on THIS
+        // walk. Without this, a 3-page site spent most of the remaining watchdog
+        // re-capturing identical DOMs and pushing them toward the output cap, then
+        // fed the same HTML to link extraction nine times. Note this does not fire
+        // for an app that answers an out-of-range page with a fresh empty page
+        // under a fresh hash, so the page cap is the real bound there.
         if (seenHashes.has(got.hash)) break;
         seenHashes.add(got.hash);
         pages.push(got);
       }
       await browser.close();
       clearTimeout(watchdog);
-      emit({ ok: true, status, url: frame.url(), html, text, pages });
+      // `partial` marks a walk that STOPPED EARLY rather than running out of pages.
+      // It used to be set only on the hard-watchdog path, so a wall-clock or
+      // evaluate-failure truncation was indistinguishable from a complete walk —
+      // and the caller then made a permanent indexing and safety decision from
+      // whatever prefix of the site it happened to get before the clock ran out.
+      emit({ ok: true, status, url: frame.url(), html, text, pages, partial: truncated });
       return;
     }
 

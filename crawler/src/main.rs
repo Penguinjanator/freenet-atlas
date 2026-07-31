@@ -154,6 +154,13 @@ struct Cli {
     /// fresh render, so this is bounded for tidiness rather than cost.
     #[arg(long, default_value_t = 12)]
     hub_max_pages: usize,
+    /// Max pages to walk when DESCRIBING an app-hosted resource (a Delta site's
+    /// own pages). Lower than `--hub-max-pages`: a hub is one page whose
+    /// whole purpose is to list links, whereas this runs once per site indexed, so
+    /// the time is paid far more often. Enough to reach a site's real content when
+    /// its landing page is a stub, without walking a large site exhaustively.
+    #[arg(long, default_value_t = 6)]
+    app_max_pages: usize,
     /// If set, loop every N seconds instead of running once. Cheap sources
     /// (River rooms) are polled every tick, so this can be small; expensive hub
     /// re-rendering is rate-limited separately by `--hub-interval`.
@@ -1903,9 +1910,59 @@ struct Page {
     html: String,
     text: String,
     /// Additional pages of the SAME app-hosted resource, discovered by walking the
-    /// app's internal routes in one browser session. Their HTML is mined for links;
-    /// the resource itself is still described from the entry page.
+    /// app's internal routes in one browser session. Their HTML is mined for links.
     extra_pages: Vec<String>,
+    /// Content-region text of those same pages.
+    ///
+    /// Separate from `extra_pages` because the two are used for different things and
+    /// must not be conflated: links come from the raw HTML, but DESCRIBING a page
+    /// needs the content region only. Stripping the HTML here would feed the app's
+    /// chrome to the describer, which is what `--require-content` exists to prevent.
+    ///
+    /// The two vectors leave the renderer aligned, but the describe path drops
+    /// pages that turn out to serve another site's content, so they are NOT index
+    /// -aligned thereafter. Nothing may zip them.
+    extra_texts: Vec<String>,
+    /// The walk STOPPED EARLY rather than running out of pages: the wall clock ran
+    /// out, or a step failed. What was captured is an arbitrary prefix of the site.
+    truncated: bool,
+}
+
+impl Page {
+    /// Everything this locator has to say, entry page first.
+    ///
+    /// An app-hosted site is ONE locator with several pages, so this is what should
+    /// be described and safety-rated — not the landing page alone. Judging a site on
+    /// its landing page left `app:delta/AWPjDQdKey` deferred as too thin every run
+    /// while an 11,000-character second page sat behind it.
+    ///
+    /// Entry page FIRST, and each distinct page at most once.
+    ///
+    /// Both properties are load-bearing, not tidiness. `describe_llm` truncates to
+    /// the first 6000 characters, so entry-last would push the landing page out of
+    /// the classifier's view on a large site — the one direction this must never
+    /// move the safety gate. And the walk starts at page 1 while the bare
+    /// `app:slug/res` locator resolves to the app's own default route, so a site
+    /// whose landing page IS page 1 renders the same text twice: without the
+    /// dedup, a 110-character stub joins with itself to clear the 200-character
+    /// floor on zero new information, which is exactly what that floor exists to
+    /// stop. Same-text pages are compared whitespace-insensitively, because a
+    /// re-render of one page can differ in line breaks without differing at all.
+    fn describable_text(&self) -> String {
+        let mut seen: Vec<String> = Vec::new();
+        let mut out: Vec<&str> = Vec::new();
+        for t in
+            std::iter::once(self.text.as_str()).chain(self.extra_texts.iter().map(String::as_str))
+        {
+            let norm = normalise_text(t);
+            if norm.is_empty() || seen.contains(&norm) {
+                continue;
+            }
+            seen.push(norm);
+            out.push(t);
+        }
+        out.join("\n\n")
+    }
 }
 
 /// Index one locator (`https://...` or `freenet:<id><path>`): fetch its content,
@@ -1925,17 +1982,58 @@ fn index_locator(
     registry: &AppRegistryView,
     baselines: &mut AppBaselines,
 ) -> Result<bool> {
-    let page = get_page(cli, client, gw, loc, registry)?;
+    // Walk an app-hosted resource's OTHER pages before describing it. A Delta site
+    // is one locator with several pages, and reading only the landing page judged
+    // the whole site on it: `app:delta/AWPjDQdKey` ("Ian Clarke's Delta Website")
+    // has a ~100-character home page and an 11,000-character second page, so it was
+    // deferred as too thin every run and never indexed, while its actual content sat
+    // one page over. Enumeration already existed for hub crawling; it was simply
+    // never wired into the path that describes a site.
+    //
+    // Cheap relative to the first load: each extra page is an in-session hash
+    // navigation, not a fresh render. `resource_of` returns None for a non-app or
+    // non-fragment-routed locator, so nothing else pays for this.
+    let app = registry.app_of(loc);
+    let enumerate = app
+        .as_ref()
+        .map(|(_, resource)| (resource.as_str(), cli.app_max_pages));
+    let mut page = get_page_enumerating(cli, client, gw, loc, registry, enumerate)?;
+    // A PREFIX of a multi-page site is not the site. Refuse rather than decide
+    // permanently on it — see `TruncatedWalk`.
+    //
+    // Only when the walk actually captured part of one, though. A walk that ran out
+    // of clock before its first step tells us nothing except what we already knew:
+    // the entry page, which is exactly what this locator was judged on before any of
+    // this existed. Refusing there discarded sites that were being indexed correctly
+    // — a single-page site with a 10,000-character landing page would be thrown away
+    // on a slow gateway for failing to walk pages it does not have.
+    if page.truncated && !page.extra_texts.is_empty() {
+        return Err(TruncatedWalk.into());
+    }
     // Before spending anything: is this actually a page about the resource we asked
     // for, or the app's fallback content for a resource it could not load? The latter
     // reads as a perfectly good page, so this has to be checked explicitly.
-    if let Some(slug) = loc
-        .strip_prefix("app:")
-        .and_then(|rest| rest.split_once('/'))
-        .map(|(slug, _)| slug)
-    {
+    if let Some((slug, _)) = &app {
+        // Each page separately against the ENTRY-page baseline, never the joined
+        // text: the baseline is what the app renders for a resource that does not
+        // exist, so folding pages together would dilute it below the match
+        // threshold and let a fallback through.
         if baselines.is_placeholder(cli, client, gw, registry, slug, &page.text) {
             return Err(PlaceholderPage.into());
+        }
+        // The walk asks for pages 1..N unconditionally, so a site with fewer pages
+        // than that is asked for routes it does not have — precisely the case this
+        // app answers with some OTHER site's content. Screening only the entry page
+        // would let that fallback in through page 4 and hand the classifier a
+        // description of a site the reader never asked about, which is the
+        // cross-contamination this baseline exists to stop. The baseline is already
+        // cached by the check above, so this costs a string compare and no render.
+        let before = page.extra_texts.len();
+        page.extra_texts
+            .retain(|t| !baselines.is_placeholder(cli, client, gw, registry, slug, t));
+        let dropped = before - page.extra_texts.len();
+        if dropped > 0 {
+            eprintln!("  dropped {dropped} enumerated page(s) serving another site's content");
         }
     }
     index_page(cli, client, key, model, loc, kind, trusted, &page)
@@ -1984,7 +2082,8 @@ fn index_page(
     // then publish whatever it says: the rating IS the safety gate, and a gate fed
     // no evidence is not a gate. Notably this is the image-only-site case, which is
     // both the likeliest NSFW vector and the one the text rating is blindest to.
-    let visible = page.text.trim().chars().count();
+    let body = page.describable_text();
+    let visible = body.trim().chars().count();
     if visible < MIN_DESCRIBABLE_CHARS {
         // `TooThin`, not a plain error: this verdict is DETERMINISTIC for a given
         // page, so charging it a retry means three runs with a broken renderer (node
@@ -1999,7 +2098,7 @@ fn index_page(
         // rating, so doing that turns any OpenAI hiccup (a 429 an attacker can
         // induce by flooding links, a content-policy 400 on exactly the
         // material the gate exists to catch) into an open door to the index.
-        Some(k) => match describe_llm(client, k, model, loc, &page.text) {
+        Some(k) => match describe_llm(client, k, model, loc, &body) {
             Ok(d) => d,
             Err(e) if trusted => {
                 eprintln!("  llm failed ({e:#}), falling back to title/meta");
@@ -2099,7 +2198,11 @@ fn get_page_enumerating(
 ) -> Result<Page> {
     // An app-hosted locator carries no address of its own; resolve it through the
     // registry to the container URL that actually serves it.
-    let is_app = loc.starts_with("app:");
+    // Tied to the enumeration decision, NOT re-derived from the `app:` spelling.
+    // When those two disagreed, a `freenet:<container>/#<resource>` locator walked
+    // the app's pages with the chrome guard off, so the describer was handed several
+    // copies of the app shell's sidebar instead of the site.
+    let is_app = enumerate.is_some() || loc.starts_with("app:");
     let resolved = if loc.starts_with("app:") {
         registry
             .resolve_for_fetch(loc)
@@ -2151,6 +2254,8 @@ fn get_page_enumerating(
             html,
             text,
             extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
         })
     } else {
         ssrf_check(loc)?;
@@ -2160,6 +2265,8 @@ fn get_page_enumerating(
             html,
             text,
             extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
         })
     }
 }
@@ -2246,8 +2353,14 @@ fn render_page(
     }
     let html = v["html"].as_str().unwrap_or("").to_string();
     let text = v["text"].as_str().unwrap_or("").to_string();
-    // Fall back to stripping the rendered HTML if the browser gave no innerText.
-    let text = if text.trim().is_empty() {
+    // Fall back to stripping the rendered HTML if the browser gave no innerText —
+    // but NOT for an app, where empty means the content region was absent and the
+    // whole frame IS the chrome. Stripping it there defeated `--require-content`
+    // entirely: the guard returned '' exactly as designed and this handed the
+    // describer the app shell anyway, which is how a sidebar listing every visited
+    // site became a site's description. Empty text leaves the locator under the
+    // describable floor, which defers it for free and burns no retry.
+    let text = if text.trim().is_empty() && !require_content {
         visible_text(&html)
     } else {
         text
@@ -2255,15 +2368,25 @@ fn render_page(
     if html.trim().is_empty() && text.trim().is_empty() {
         bail!("renderer returned empty page");
     }
-    let extra_pages: Vec<String> = v["pages"]
+    // ONE pass producing pairs, then split. Reading the array twice with different
+    // filters (`filter_map` on html, `map` on text) silently desynchronises them the
+    // first time the renderer emits a page carrying one key and not the other.
+    let (extra_pages, extra_texts): (Vec<String>, Vec<String>) = v["pages"]
         .as_array()
         .map(|ps| {
             ps.iter()
                 .skip(1) // [0] is the entry page, already captured above
-                .filter_map(|p| p["html"].as_str().map(str::to_string))
-                .collect()
+                .filter_map(|p| {
+                    let html = p["html"].as_str()?;
+                    Some((
+                        html.to_string(),
+                        p["text"].as_str().unwrap_or("").to_string(),
+                    ))
+                })
+                .unzip()
         })
         .unwrap_or_default();
+    let truncated = v["partial"].as_bool().unwrap_or(false);
     if !extra_pages.is_empty() {
         eprintln!("  enumerated {} additional page(s)", extra_pages.len());
     }
@@ -2271,6 +2394,8 @@ fn render_page(
         html,
         text,
         extra_pages,
+        extra_texts,
+        truncated,
     })
 }
 
@@ -2352,9 +2477,36 @@ fn is_unresolvable_app(e: &anyhow::Error) -> bool {
 /// charging it an attempt would eventually blacklist a page for good.
 fn is_deterministic_refusal(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
-        c.downcast_ref::<TooThin>().is_some() || c.downcast_ref::<PlaceholderPage>().is_some()
+        c.downcast_ref::<TooThin>().is_some()
+            || c.downcast_ref::<PlaceholderPage>().is_some()
+            || c.downcast_ref::<TruncatedWalk>().is_some()
     })
 }
+
+/// "The walk of this site stopped early, so what we have is an arbitrary prefix."
+///
+/// Indexing decides two things permanently: the description, and the content-safety
+/// rating — and the locator is written to the seen file either way, so nothing ever
+/// revisits it. Deciding those from however many pages fit before the clock ran out
+/// makes the verdict a race on gateway latency: the same site rates `ok` on a fast
+/// run and could rate otherwise on a slow one, with whichever ran first standing
+/// forever. Refusing is the honest option — the locator stays queued, burns no
+/// retry, and says why in the log, so a site that can never be walked in time is a
+/// visible condition rather than a coin flip already spent.
+#[derive(Debug)]
+struct TruncatedWalk;
+
+impl std::fmt::Display for TruncatedWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the walk of this site stopped early, so its description and safety \
+             rating would be decided from an arbitrary prefix of it"
+        )
+    }
+}
+
+impl std::error::Error for TruncatedWalk {}
 
 /// Per-run cache of what each app renders for a resource that DOES NOT EXIST.
 ///
@@ -3095,6 +3247,19 @@ impl AppRegistryView {
     /// That is still a heuristic; the registry declaring its pagination shape is the
     /// real fix, filed alongside the resource-shape issue.
     fn resource_of(&self, loc: &str) -> Option<String> {
+        self.app_of(loc).map(|(_, resource)| resource)
+    }
+
+    /// The app SLUG and resource a locator names, in either spelling.
+    ///
+    /// One resolution behind every decision that turns on "is this an app-hosted
+    /// resource": which pages to walk, whether to demand the content region instead
+    /// of the app shell's chrome, and which missing-resource baseline to screen
+    /// against. Deriving those from separate predicates is what let a
+    /// `freenet:<container>/#<resource>` locator enumerate with the chrome guard
+    /// OFF — the shape that put an app sidebar's list of unrelated sites into a
+    /// site's description.
+    fn app_of(&self, loc: &str) -> Option<(String, String)> {
         let mapped = if loc.starts_with("app:") {
             loc.to_string()
         } else {
@@ -3119,7 +3284,7 @@ impl AppRegistryView {
         {
             return None;
         }
-        Some(resource.to_string())
+        Some((slug.to_string(), resource.to_string()))
     }
 }
 
@@ -5033,6 +5198,276 @@ mod tests {
         assert!(!p.contains("https://flaky.example/1"));
     }
 
+    /// A site is described from ALL its pages, not just the landing page. Judging
+    /// a site on page 1 left `app:delta/AWPjDQdKey` unindexed for good: its home
+    /// page is Delta's default stub ("Welcome to your new site", 97 characters,
+    /// under the 200-character floor) while page 2 holds a 10,264-character
+    /// document. Every run deferred it as too thin.
+    #[test]
+    fn a_site_is_described_from_all_its_pages() {
+        let stub = "Welcome to your new site.".to_string();
+        let real = "x".repeat(500);
+        let third = "y".repeat(300);
+        let page = Page {
+            html: String::new(),
+            text: stub.clone(),
+            extra_pages: vec!["<html/>".into(), "<html/>".into()],
+            extra_texts: vec![real.clone(), third.clone()],
+            truncated: false,
+        };
+        let body = page.describable_text();
+        // The EXACT joined string, not two `contains` calls. `contains` is order-
+        // blind and count-blind, so it survives keeping only one extra page,
+        // reversing the order, or dropping the separator. Order is not cosmetic:
+        // `describe_llm` truncates to the first 6000 characters, so entry-last
+        // would push the landing page out of the rater's view on a large site —
+        // the one direction this change must never move the safety gate.
+        assert_eq!(
+            body,
+            format!("{stub}\n\n{real}\n\n{third}"),
+            "every page reaches the describer, entry page first, in render order"
+        );
+        assert!(
+            body.trim().chars().count() >= MIN_DESCRIBABLE_CHARS,
+            "a stub landing page must not sink a site whose content is one page over"
+        );
+        assert!(
+            page.text.trim().chars().count() < MIN_DESCRIBABLE_CHARS,
+            "test premise: the landing page alone really is below the floor"
+        );
+    }
+
+    /// A page repeated is not a page of new evidence.
+    ///
+    /// The walk starts at page 1 while the bare `app:slug/resource` locator resolves
+    /// to the app's default route, so a site whose landing page IS page 1 renders
+    /// the same text twice under two different hashes — the renderer's own
+    /// already-seen check compares hashes, so it does not fire. Without a dedup, a
+    /// stub joins with itself and clears the describable floor on nothing: the
+    /// reference site's 97-character stub reaches 196, and a 110-character one
+    /// reaches 222 and is published, described, and marked seen forever, on text
+    /// the floor had already judged too thin to rate for safety.
+    #[test]
+    fn a_repeated_page_does_not_help_a_site_clear_the_floor() {
+        let stub = "Welcome to your new site.".repeat(5); // 125 chars, under the floor
+        let page = Page {
+            html: String::new(),
+            text: stub.clone(),
+            extra_pages: vec!["<html/>".into()],
+            // Same text, re-rendered: whitespace differs, substance does not.
+            extra_texts: vec![stub.replace(' ', "\n")],
+            truncated: false,
+        };
+        assert_eq!(
+            page.describable_text(),
+            stub,
+            "the same page twice must count once"
+        );
+        assert!(
+            page.describable_text().trim().chars().count() < MIN_DESCRIBABLE_CHARS,
+            "and must therefore still be refused as too thin, not doubled past the \
+             floor on text already judged insufficient to rate"
+        );
+    }
+
+    /// With no extra pages the behaviour is exactly as before — this can only ever
+    /// ADD evidence for the safety rating, never remove it.
+    #[test]
+    fn describable_text_is_unchanged_for_a_single_page() {
+        let page = Page {
+            html: String::new(),
+            text: "just the one page".into(),
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
+        };
+        assert_eq!(page.describable_text(), "just the one page");
+
+        // An app that returns a blank page must not pad the text with separators
+        // and sneak past the floor on whitespace.
+        let blank = Page {
+            html: String::new(),
+            text: "short".into(),
+            extra_pages: vec!["<html/>".into(), "<html/>".into()],
+            extra_texts: vec!["   ".into(), String::new()],
+            truncated: false,
+        };
+        // NOT `.trim()`ed: trimming the result would consume the very artifact
+        // this asserts the absence of, so the filter could be deleted with the
+        // test still green. Interior separators survive `body.trim()` at the
+        // floor check, and an unrendered page's untrimmed innerText is a
+        // whitespace blob of arbitrary size — that is a site clearing the
+        // describable floor on whitespace and reaching the rater with no
+        // evidence, which is what the floor exists to prevent.
+        assert_eq!(
+            blank.describable_text(),
+            "short",
+            "empty pages must contribute nothing, not separator whitespace"
+        );
+    }
+
+    /// The enumeration must happen on the path that DESCRIBES a locator, not only
+    /// when crawling a hub. That was the whole defect: the machinery existed and
+    /// was wired into `crawl_hub` alone.
+    #[test]
+    fn the_indexing_path_enumerates_an_app_resource() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn the_indexing_path_enumerates"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let at = production
+            .find("fn index_locator(")
+            .expect("index_locator must exist");
+        let body = &production[at..];
+        let end = body
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = strip_comments(&production[at..end]);
+        assert!(
+            body.contains("registry.app_of(loc)") && body.contains("get_page_enumerating("),
+            "index_locator must walk an app resource's other pages, or a site with a \
+             stub landing page is judged on the stub"
+        );
+        // The page BUDGET too, not just the call. Passing a literal 0 (or the hub's
+        // count) keeps both needles above, compiles without a warning, and fully
+        // restores the bug: render.js emits no `pages` key at all when the max is 0.
+        assert!(
+            body.contains("cli.app_max_pages"),
+            "the walk must be bounded by --app-max-pages, or the flag is orphaned \
+             and the walk silently does nothing"
+        );
+        // Screening the walked pages, not only the entry page. The app answers a
+        // route it does not have with another site's content, and the walk asks for
+        // pages the site may not have, so an unscreened extra page hands the
+        // classifier a description of a site the reader never asked for.
+        assert!(
+            body.contains(".retain(|t| !baselines.is_placeholder("),
+            "every enumerated page must be screened against the missing-resource \
+             baseline, not just the entry page"
+        );
+        // The describer lives in its own function, so assert there rather than in
+        // index_locator's body: the floor check and the LLM call must both read the
+        // whole site, or enumerating it achieves nothing.
+        let desc = strip_comments(production);
+        assert!(
+            desc.contains("let body = page.describable_text();"),
+            "the describe path must read the whole site"
+        );
+        assert!(
+            desc.contains("let visible = body.trim().chars().count();"),
+            "the too-thin floor must be measured on the whole site, or a stub \
+             landing page still sinks it"
+        );
+        assert!(
+            desc.contains("describe_llm(client, k, model, loc, &body)"),
+            "and the LLM must be given the whole site, not just the entry page"
+        );
+    }
+
+    /// A walk that stopped early must not decide anything permanently.
+    ///
+    /// Indexing writes the locator to the seen file whether it publishes or refuses
+    /// on safety grounds, and nothing revisits it, so deciding from however many
+    /// pages fit before the clock ran out makes the verdict a race on gateway
+    /// latency. It has to route to the refusal class that leaves the locator queued
+    /// and burns no retry — an ordinary error would spend one of three attempts and
+    /// eventually quarantine a site whose only fault is being slow to walk.
+    #[test]
+    fn a_truncated_walk_is_refused_rather_than_decided() {
+        assert!(
+            is_deterministic_refusal(&TruncatedWalk.into()),
+            "a truncated walk must leave the locator queued with no retry burned"
+        );
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn a_truncated_walk_is_refused"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let production = strip_comments(production);
+        assert!(
+            production.contains("if page.truncated && !page.extra_texts.is_empty() {")
+                && production.contains("return Err(TruncatedWalk.into());"),
+            "the describe path must check the flag; parsing it and ignoring it is \
+             the state this replaced"
+        );
+        assert!(
+            production.contains(r#"v["partial"].as_bool()"#),
+            "and the flag must actually be read off the renderer's output"
+        );
+    }
+
+    /// The renderer half of the same fix, which no Rust test can otherwise reach.
+    ///
+    /// `extra_texts` is populated from exactly one line of JavaScript. Delete it and
+    /// every extra page arrives as an empty string, `describable_text` filters them
+    /// all out, and a site is judged on its landing page again — the precise defect
+    /// this PR removes, restored with the whole Rust suite green and an operator log
+    /// that still reads healthy ("enumerated 6 additional page(s)" counts HTML, not
+    /// text). There is no JS test harness in this repo, so pin the source.
+    ///
+    /// Self-match is structurally impossible here, unlike the pins above: the needle
+    /// lives in main.rs and the scanned text is render.js, a different file. The
+    /// COUNT is what makes it bite — `contains` alone stays green when the entry
+    /// page keeps its capture and the enumerated pages lose theirs.
+    #[test]
+    fn the_renderer_captures_text_for_every_enumerated_page() {
+        let js = include_str!("../render.js");
+        assert_eq!(
+            js.matches("contentText(").count(),
+            3,
+            "expected exactly three: the definition, the entry-page call, and the \
+             per-enumerated-page call — a missing one means a site is described \
+             from its landing page alone again"
+        );
+        assert!(
+            js.contains("got.text = await contentText(f2)"),
+            "each enumerated page must capture its CONTENT-REGION text; stripping \
+             its HTML instead would feed the app's chrome to the describer"
+        );
+        // Landing back on the entry page must SKIP, not stop. The entry is whatever
+        // the sources file named, so a walk starting at #res/3 meets its own entry
+        // on step 3 — stopping there loses every page after it.
+        assert!(
+            js.contains("if (got.hash === entryHash)") && js.contains("continue;"),
+            "revisiting the entry page must skip it, not end the walk"
+        );
+        // An early stop must be reported. Unreported, the caller cannot tell a
+        // complete walk from a prefix, and decides permanently on whichever it got.
+        assert_eq!(
+            js.matches("truncated = true;").count(),
+            3,
+            "every early exit must mark the walk: the wall clock, a failed hash \
+             step, and a failed capture — a bare `contains` stays green while the \
+             wall-clock one, the likeliest of the three, is deleted"
+        );
+        assert!(
+            js.contains("partial: truncated"),
+            "and the mark must reach the caller"
+        );
+        assert!(
+            js.contains("const stopBy = startedAt + WATCHDOG_MS - ENUM_RESERVE_MS;"),
+            "the walk deadline must share the watchdog's origin, or the reserve \
+             grants itself a fresh budget and stops bounding anything"
+        );
+        // WHERE the origin is taken is the whole fix; the arithmetic above was
+        // never wrong. Moving this assignment inside the async body restores the
+        // bug with the expression pin still green.
+        assert!(
+            js.contains("\nconst startedAt = Date.now();"),
+            "the origin must be taken at MODULE scope, i.e. process start"
+        );
+    }
+
     #[test]
     fn quarantine_releases_only_when_due() {
         let f = TmpFile::new("quarantine-cooldown");
@@ -6073,8 +6508,11 @@ mod tests {
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
+            "fn a_truncated_walk_is_refused_rather_than_decided",
             "fn the_give_up_branch_quarantines_and_does_not_blacklist",
             "fn strip_comments",
+            "fn the_indexing_path_enumerates_an_app_resource",
+            "fn the_renderer_captures_text_for_every_enumerated_page",
         ] {
             // COUNT, not `contains`. Each name appears twice in a healthy file:
             // the definition, and the literal in this list. A bare `contains`
