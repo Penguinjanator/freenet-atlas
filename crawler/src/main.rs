@@ -104,6 +104,11 @@ struct Cli {
     /// Path to the atlasctl binary.
     #[arg(long, default_value = "atlasctl")]
     atlasctl: String,
+    /// Path to the riverctl binary, used ONLY to cross-check the room-contract
+    /// key against an independently-maintained source. See
+    /// [`riverctl_room_key`] for why a self-contained check cannot work.
+    #[arg(long, default_value = "riverctl")]
+    riverctl: String,
     /// Node binary used to drive the headless renderer.
     #[arg(long, default_value = "node")]
     node_bin: String,
@@ -2978,6 +2983,142 @@ fn room_candidate_keys(owner_vk: &VerifyingKey) -> Vec<ContractKey> {
     keys
 }
 
+/// Ask `riverctl` which contract key the room ACTUALLY lives at right now.
+///
+/// This exists because no self-contained check can answer that question. When
+/// River re-keys the room contract, the new key is derived from a WASM this
+/// crate does not have and from a `river-core` registry entry that does not
+/// exist yet — so the live key is not merely un-derived here, it is
+/// *underivable*. [`room_candidate_keys`] can enumerate the current bundled
+/// generation and every RETIRED one, and the live key is in neither set. That
+/// is precisely how the Official room was read from a dead generation for
+/// three days (fix: 3ed8529) and, before that, for thirteen (362e135).
+///
+/// Every guard that failed in those incidents was self-contained, and each
+/// failed the same way — its inputs rot from the one cause it is meant to
+/// detect:
+///
+///   - `the_bundled_wasm_is_not_yet_legacy` asks "is my WASM retired?", but can
+///     only answer from the `river-core` registry it was compiled against. Pin
+///     an older `river-core` and the answer is permanently "no".
+///   - `room_key_derivation_matches_the_live_network` compares the derived key
+///     to `OFFICIAL_CURRENT_KEY`. Both are in-repo values refreshed by the same
+///     human in the same edit, so they agree with each other while both being
+///     wrong.
+///   - The runtime "resolved via LEGACY generation" warning fires when
+///     resolution lands on a candidate other than index 0 — but a stale bundle
+///     is what DEFINES index 0, so it logged "generation 0/32" throughout.
+///
+/// `riverctl` breaks that pattern because it is maintained on a genuinely
+/// independent track: `riverctl-autoupdate.sh` reinstalls it hourly from
+/// crates.io and — critically — refuses to stamp itself healthy unless the
+/// freshly-derived key returns a live room with real members. It answers "where
+/// is the room?" rather than "are my own build inputs stale?", which is the
+/// only form of the question a stale artifact cannot get wrong.
+///
+/// Failure here is deliberately NOT fatal. Discovery is free and a room evicts
+/// messages past `max_recent_messages`, so a link not captured today may not
+/// exist tomorrow; refusing to crawl because a cross-check tool is missing
+/// would lose data permanently to protect against reading a *possibly* stale
+/// room. The caller logs loudly and falls back to derived candidates.
+///
+/// Trusting `riverctl`'s answer is safe even though it is a subprocess: the key
+/// only selects which contract to GET, and [`fetch_room_state`] still rejects
+/// any state whose configuration is not signed by the expected `owner_vk`. A
+/// wrong or hostile key yields no room, never a forged one.
+fn riverctl_room_instance_id(riverctl: &str, owner_vk_b58: &str) -> Result<ContractInstanceId> {
+    let output = Command::new(riverctl)
+        .arg("--no-version-check")
+        .arg("debug")
+        .arg("contract-key")
+        .arg(owner_vk_b58)
+        .env("RIVERCTL_NO_VERSION_CHECK", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("could not run {riverctl}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "riverctl debug contract-key exited {}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_riverctl_contract_key(&stdout)
+}
+
+/// Pull the contract id out of `riverctl debug contract-key` output.
+///
+/// Split out from the spawn so the parse is testable without a riverctl on the
+/// box — the format is riverctl's to change, and a silent parse failure here
+/// would disable the cross-check exactly like the guards it replaces.
+fn parse_riverctl_contract_key(stdout: &str) -> Result<ContractInstanceId> {
+    let key_b58 = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Contract key:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("no 'Contract key:' line in riverctl output"))?;
+    // Decode and length-check by hand rather than using
+    // `ContractInstanceId::from_base58`. That helper decodes `onto` a pre-zeroed
+    // 32-byte buffer and only errors when the input is too LONG, so a TRUNCATED
+    // key is silently zero-padded into a well-formed id for some other contract
+    // — a garbled line would become a confident probe of the wrong address
+    // instead of an error. Same explicit shape as `parse_owner_vk`.
+    let bytes = bs58::decode(key_b58)
+        .into_vec()
+        .with_context(|| format!("riverctl contract key {key_b58:?} is not valid base58"))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "riverctl contract key {key_b58:?} decodes to {} bytes, expected 32",
+            bytes.len()
+        )
+    })?;
+    Ok(ContractInstanceId::new(arr))
+}
+
+/// The candidate ids to probe, with `riverctl`'s authoritative answer promoted
+/// to the front when it disagrees with our own derivation.
+///
+/// Returns the list plus a note when something is off, so the caller can log it
+/// once, loudly, at the point of drift.
+fn cross_checked_candidate_ids(
+    derived: Vec<ContractInstanceId>,
+    owner_vk_b58: &str,
+    riverctl: &str,
+) -> (Vec<ContractInstanceId>, Option<String>) {
+    let mut ids = derived;
+    match riverctl_room_instance_id(riverctl, owner_vk_b58) {
+        Ok(authoritative) => {
+            if ids.first() == Some(&authoritative) {
+                return (ids, None);
+            }
+            let note = format!(
+                "bundled room_contract.wasm is STALE: riverctl says the room is at {} \
+                 but our derivation says {}. Using riverctl's answer so ingestion keeps \
+                 working; refresh the bundle (cp river/main/cli/contracts/\
+                 room_contract.wasm crawler/contracts/room_contract.wasm, then update \
+                 OFFICIAL_CURRENT_KEY) to silence this",
+                authoritative,
+                ids.first()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "<none>".into()),
+            );
+            // Promote, don't just prepend: the authoritative id may already sit
+            // in the legacy list, and probing it twice would waste a round-trip
+            // and make `resolved_idx` ambiguous.
+            ids.retain(|id| id != &authoritative);
+            ids.insert(0, authoritative);
+            (ids, Some(note))
+        }
+        Err(error) => {
+            let note = format!(
+                "could not cross-check the room key with riverctl ({error:#}); falling \
+                 back to the bundled derivation, which CANNOT detect a re-key on its own"
+            );
+            (ids, Some(note))
+        }
+    }
+}
+
 /// GET a River room's state from the local node, trying each candidate key
 /// (current then legacy) until one returns a real, owner-signed room. Returns
 /// the deserialized state with its computed actions-state rebuilt, or `None` if
@@ -3080,7 +3221,12 @@ fn crawl_river_room(
         }
     };
     let candidate_keys = room_candidate_keys(&owner_vk);
-    let candidate_ids: Vec<ContractInstanceId> = candidate_keys.iter().map(|k| *k.id()).collect();
+    let derived_ids: Vec<ContractInstanceId> = candidate_keys.iter().map(|k| *k.id()).collect();
+    let (candidate_ids, drift) =
+        cross_checked_candidate_ids(derived_ids, owner_vk_b58, &cli.riverctl);
+    if let Some(note) = drift {
+        eprintln!("river-room {owner_vk_b58}: WARNING {note}");
+    }
 
     // The WS GET is async; run it on a short-lived runtime and return the owned
     // state, so the blocking-reqwest indexing below never runs inside a tokio
@@ -5501,6 +5647,167 @@ mod tests {
         );
     }
 
+    fn test_id(seed: u8) -> ContractInstanceId {
+        ContractInstanceId::new([seed; 32])
+    }
+
+    #[test]
+    fn a_riverctl_contract_key_line_parses() {
+        // Exactly the shape riverctl emits today, leading blank line and all.
+        let out = "Room owner key: 4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4\n\
+                   Contract key: 9rhuzMSn4v4AugF5FhrjuB1tGP936TaP6Dp7fXijNPUL\n";
+        let id = parse_riverctl_contract_key(out).expect("parses");
+        assert_eq!(
+            id.to_string(),
+            "9rhuzMSn4v4AugF5FhrjuB1tGP936TaP6Dp7fXijNPUL"
+        );
+    }
+
+    /// A parse that silently yields "no answer" would disable the cross-check
+    /// and put us straight back in the failure it exists to prevent, so every
+    /// malformed shape must be a hard error rather than a `None` that the
+    /// caller treats as "nothing to compare".
+    #[test]
+    fn a_malformed_riverctl_answer_is_an_error_not_a_shrug() {
+        for bad in [
+            "",
+            "Room owner key: abc\n",
+            "Contract key:\n",
+            "Contract key: not-base58-!!!\n",
+            "Contract key: tooshort\n",
+        ] {
+            assert!(
+                parse_riverctl_contract_key(bad).is_err(),
+                "{bad:?} must not parse into a usable key"
+            );
+        }
+    }
+
+    /// THE regression test for the three-day dead-room read (3ed8529).
+    ///
+    /// The bundled derivation says one thing, riverctl says another; riverctl
+    /// wins, and the drift is reported. Before this cross-check existed, the
+    /// derived id was used unconditionally and the run looked perfectly healthy
+    /// while reading an abandoned contract.
+    #[test]
+    fn riverctls_answer_wins_when_the_bundle_is_stale() {
+        let live = test_id(1);
+        let stale = test_id(2);
+        let legacy = test_id(3);
+        let (ids, note) = cross_checked_candidate_ids(
+            vec![stale, legacy],
+            OFFICIAL_OWNER_VK,
+            // A stub standing in for riverctl: prints the live key and exits 0.
+            &stub_riverctl(&live.to_string()),
+        );
+        assert_eq!(ids[0], live, "riverctl's answer must be probed FIRST");
+        assert!(
+            ids.contains(&stale) && ids.contains(&legacy),
+            "the derived candidates must be kept as fallbacks, not discarded"
+        );
+        let note = note.expect("a stale bundle must be reported, not silently corrected");
+        assert!(
+            note.contains("STALE"),
+            "the drift note must name the problem loudly: {note}"
+        );
+    }
+
+    #[test]
+    fn agreement_is_silent_and_changes_nothing() {
+        let live = test_id(1);
+        let legacy = test_id(3);
+        let (ids, note) = cross_checked_candidate_ids(
+            vec![live, legacy],
+            OFFICIAL_OWNER_VK,
+            &stub_riverctl(&live.to_string()),
+        );
+        assert_eq!(ids, vec![live, legacy], "agreement must not reorder");
+        assert!(note.is_none(), "agreement must not warn: {note:?}");
+    }
+
+    /// Promotion must not leave a duplicate behind: probing the same id twice
+    /// wastes a round-trip and makes `resolved_idx` ambiguous, which is the
+    /// value the LEGACY warning is computed from.
+    #[test]
+    fn promoting_an_id_already_in_the_legacy_list_does_not_duplicate_it() {
+        let live = test_id(1);
+        let stale = test_id(2);
+        let (ids, note) = cross_checked_candidate_ids(
+            vec![stale, live],
+            OFFICIAL_OWNER_VK,
+            &stub_riverctl(&live.to_string()),
+        );
+        assert_eq!(ids, vec![live, stale]);
+        assert_eq!(
+            ids.iter().filter(|id| **id == live).count(),
+            1,
+            "the promoted id must appear exactly once"
+        );
+        assert!(note.is_some());
+    }
+
+    /// A missing/broken riverctl must NOT stop the crawl. Discovery is free and
+    /// a room evicts old messages, so refusing to crawl would lose links
+    /// permanently to guard against a room that is probably fine. It must still
+    /// say so loudly, because in that state we are blind to a re-key again.
+    #[test]
+    fn an_unavailable_riverctl_degrades_loudly_but_still_crawls() {
+        let stale = test_id(2);
+        let (ids, note) = cross_checked_candidate_ids(
+            vec![stale],
+            OFFICIAL_OWNER_VK,
+            "/nonexistent/riverctl-does-not-exist",
+        );
+        assert_eq!(ids, vec![stale], "must fall back to the derived candidates");
+        let note = note.expect("an unavailable cross-check must be reported");
+        assert!(
+            note.contains("CANNOT detect a re-key"),
+            "the note must say what protection was lost: {note}"
+        );
+    }
+
+    /// Write a throwaway shell stub that impersonates `riverctl debug
+    /// contract-key`. Returns its path.
+    fn stub_riverctl(key: &str) -> String {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "atlas-riverctl-stub-{}-{}",
+            std::process::id(),
+            key
+        ));
+        std::fs::create_dir_all(&dir).expect("stub dir");
+        let path = dir.join("riverctl");
+        let mut f = std::fs::File::create(&path).expect("stub file");
+        writeln!(f, "#!/bin/sh\necho \"Contract key: {key}\"").expect("write stub");
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The cross-check is only worth anything if the room crawl actually calls
+    /// it. A unit test of the helper alone stays green if someone deletes the
+    /// call site and goes back to using the derived ids directly — which is
+    /// precisely the bug, restored. Source-scrape the call site.
+    #[test]
+    fn the_room_crawl_actually_cross_checks_the_key() {
+        let src = strip_comments(include_str!("main.rs"));
+        let body = src
+            .split_once("fn crawl_river_room(")
+            .expect("crawl_river_room exists")
+            .1;
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        assert!(
+            body.contains("cross_checked_candidate_ids("),
+            "crawl_river_room must route its candidate ids through the riverctl \
+             cross-check, not use the bundled derivation directly"
+        );
+    }
+
     /// The detection gap review flagged as the highest-value fix in this
     /// module: `fetch_room_state` cannot itself distinguish "resolved via the
     /// current generation" from "silently fell through to an abandoned one",
@@ -7361,6 +7668,8 @@ mod tests {
             "fn the_bundled_wasm_looks_like_a_wasm_module",
             "fn room_candidate_keys_tries_current_generation_first",
             "fn a_non_current_generation_resolving_is_logged_loudly",
+            "fn the_room_crawl_actually_cross_checks_the_key",
+            "fn riverctls_answer_wins_when_the_bundle_is_stale",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
             "fn a_truncated_walk_is_refused_rather_than_decided",
