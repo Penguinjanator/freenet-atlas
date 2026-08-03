@@ -5395,7 +5395,7 @@ mod tests {
     /// `crawler/contracts/room_contract.wasm` is updated, or this reverts to
     /// comparing the code against itself, which is the exact defect it
     /// replaces.
-    const OFFICIAL_CURRENT_KEY: &str = "DwqkZjAZFjgB2eEUrLMpBiVr3wCnSiJNCmfV3PyDfkdZ";
+    const OFFICIAL_CURRENT_KEY: &str = "9rhuzMSn4v4AugF5FhrjuB1tGP936TaP6Dp7fXijNPUL";
 
     /// The bundled WASM is a checked-in binary a human `cp`s in — the only
     /// integrity check on its CONTENT before this. Catches an empty, truncated,

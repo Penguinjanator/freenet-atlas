@@ -1510,9 +1510,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.3"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce69f7b87ca5fedb784da0194e26a3315bc23b11e346f7a8413c48abdcac73f"
+checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
 dependencies = [
  "bincode",
  "blake3",
@@ -2853,9 +2853,9 @@ dependencies = [
 
 [[package]]
 name = "river-core"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ad9bdaefeaaee8a18d2aff6ffc9adcc12cf68ce7ee6a471cab47f975a5d9a60"
+checksum = "ccf1b00bd97f6d66b141104b8079b15e860483cd2355bccdabcff12f24369b62"
 dependencies = [
  "base64",
  "blake3",
