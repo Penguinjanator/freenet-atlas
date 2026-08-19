@@ -76,9 +76,23 @@ echo "=============================================================="
 # ---------------------------------------------------------------- PROVENANCE
 echo ""
 echo "[provenance] clean tree, on main, at origin/main, CI green"
-if [ -n "$(git status --porcelain)" ]; then
-    git status --short | sed 's/^/    /'
-    die "working tree is not clean. Publish only from a clean checkout of main."
+# TRACKED modifications only. An untracked file cannot change what is
+# published: every path this script reads (pointer-records.toml, the wasm) is
+# tracked, and the records themselves are compared against the committed blob
+# and the live network further down. Refusing on untracked files would block
+# every real publish here forever, because a working Atlas checkout normally
+# carries `stage/`, `meta.cbor` and `webapp.tar.xz` from the UI publish flow.
+#
+# They are still PRINTED rather than ignored silently — if one of them is a
+# surprise, the operator should see it before writing to the network.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    git status --short --untracked-files=no | sed 's/^/    /'
+    die "tracked files are modified. Publish only from a clean checkout of main."
+fi
+UNTRACKED="$(git status --porcelain | grep '^??' || true)"
+if [ -n "$UNTRACKED" ]; then
+    say "note: untracked files present (they cannot affect what is published):"
+    printf '%s\n' "$UNTRACKED" | sed 's/^/      /'
 fi
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || die "on branch '$BRANCH'. Publish only from main (see ~/.claude/rules/publish-from-main.md)."
@@ -212,9 +226,17 @@ but $WASM_PATH hashes to $COMMITTED_HASH. Re-sign before publishing."
     say "[2] the committed wasm derives index id $TARGET_ID"
     # (b) first: a superseded generation is on the network too, so the GET below
     # cannot tell it apart from the current one.
-    if [ -d "$(dirname "$WASM_PATH")/legacy" ]; then
-        for old_wasm in "$(dirname "$WASM_PATH")/legacy"/*.wasm; do
-            [ -f "$old_wasm" ] || continue
+    # Enumerated with `git ls-files`, not a filesystem glob. "Preserved
+    # generation" means COMMITTED, so a stray untracked wasm left in `legacy/`
+    # by a local rebuild is not one and must not be consulted. It would only
+    # ever cause a spurious refusal rather than a bad publish, but a confusing
+    # refusal on a file that is not part of the repo is still worth not having —
+    # and this is the one place where an untracked file is read by logic beyond
+    # the clean-tree check relaxed above, so the two changes belong together.
+    LEGACY_DIR="$(dirname "$WASM_PATH")/legacy"
+    if [ -d "$LEGACY_DIR" ]; then
+        while IFS= read -r old_wasm; do
+            if [ -z "$old_wasm" ] || [ ! -f "$old_wasm" ]; then continue; fi
             if [ "$(b3sum "$old_wasm" | cut -d' ' -f1)" = "$CODE_HASH" ]; then
                 die "[2] the record names $CODE_HASH, which is $(basename "$old_wasm") —
 a PRESERVED LEGACY generation, not the current one.
@@ -223,8 +245,8 @@ That generation is still on the network and still answers a GET, so nothing
 downstream would have told you. This is exactly the mistake PUBLISHING-KEYS.md
 made: it named an index id two re-keys stale and it resolved fine."
             fi
-        done
-        say "[2] the record does not name any preserved legacy generation"
+        done < <(git ls-files "$LEGACY_DIR/*.wasm")
+        say "[2] the record does not name any COMMITTED legacy generation"
     fi
     if fdev -p "$PORT" execute get --timeout 150 -o "$WORK/live_$i.bin" "$TARGET_ID" >"$WORK/live_$i.log" 2>&1 \
        && [ -s "$WORK/live_$i.bin" ]; then
