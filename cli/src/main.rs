@@ -24,7 +24,9 @@ use api::NodeClient;
 use freenet_migrate::{
     migrate_contract, FoldAllAck, Outcome, ProbeAnswer, ProbeIo, ProbeStateOps, SelectionPolicy,
 };
-use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
+use freenet_stdlib::prelude::{
+    ContractCode, ContractContainer, ContractInstanceId, ContractKey, Parameters,
+};
 
 const CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
 const DEFAULT_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
@@ -393,6 +395,11 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Print, as one JSON object, what the crawler needs to tell who publishes a
+    /// contract and whether two contracts serve the same bytes: its code hash,
+    /// its parameters (for a web container, the owner's verifying key), and a
+    /// BLAKE3 hash of the web archive when the state has the web-container layout.
+    ContractInfo { instance: String },
     /// Repair a stale replica: GET the index state from a source node and PUT it
     /// into a target node so that node serves the current state locally. Useful
     /// while cross-node subscribe/propagation is unreliable (the target may hold
@@ -512,6 +519,7 @@ async fn main() -> Result<()> {
             metadata,
         } => webapp_put(&cli, &dir, wasm, archive, metadata).await,
         Cmd::RawGet { instance, out } => raw_get(&cli, instance, out).await,
+        Cmd::ContractInfo { instance } => contract_info(&cli, instance).await,
         Cmd::PushState { from, to } => push_state(&dir, &cli.slug, from, to).await,
     }
 }
@@ -1090,6 +1098,72 @@ async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
     fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
     println!("wrote {} bytes to {}", bytes.len(), out.display());
     Ok(())
+}
+
+async fn contract_info(cli: &Cli, instance: &str) -> Result<()> {
+    let id: ContractInstanceId = instance
+        .parse()
+        .map_err(|e| anyhow!("bad instance id: {e}"))?;
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let (state, contract) = client.get_with_contract(id).await?;
+    let verified = contract.and_then(|c| {
+        let v = verified_params(&c, &id);
+        if v.is_none() {
+            eprintln!("warn: the code and params returned do not hash to {id}; ignoring them");
+        }
+        v
+    });
+    let archive = web_container_archive(&state);
+    let info = serde_json::json!({
+        "instance": id.to_string(),
+        "code_hash": verified.as_ref().map(|(code_hash, _)| code_hash.clone()),
+        "params_hex": verified.as_ref().map(|(_, params)| hex_lower(params)),
+        "state_len": state.len(),
+        "archive_len": archive.map(<[u8]>::len),
+        "archive_blake3": archive.map(|a| blake3::hash(a).to_hex().to_string()),
+    });
+    println!("{info}");
+    Ok(())
+}
+
+/// The code hash and params of `c`, but only if they hash to `id`.
+///
+/// The container's key is deserialized separately from its params and code, so
+/// a matching id on the response says nothing about whether THESE params belong
+/// to it. The crawler reads the params as the site's owner, so they are
+/// recomputed into an id and reported only if it is the contract asked for. The
+/// code hash reported is the recomputed one too, never the one that came with
+/// the response.
+fn verified_params(c: &ContractContainer, id: &ContractInstanceId) -> Option<(String, Vec<u8>)> {
+    let code = ContractCode::from(c.data().to_vec());
+    let key = ContractKey::from_params_and_code(c.params(), &code);
+    (key.id() == id).then(|| (key.code_hash().to_string(), c.params().as_ref().to_vec()))
+}
+
+/// The web archive inside a web-container state, or `None` if `state` does not
+/// have that layout EXACTLY: `[meta_len: u64 BE][meta][web_len: u64 BE][web]`
+/// with nothing left over (see `webapp_put`).
+///
+/// Exact, because the hash of this slice is used as "same bytes as another
+/// site": a lenient parse that accepted trailing data would hash a prefix and
+/// could call two different sites identical.
+///
+/// The metadata is skipped on purpose. It carries the version and the owner's
+/// signature, so two owners publishing byte-identical archives always differ
+/// there, and that is exactly the case the hash exists to catch.
+fn web_container_archive(state: &[u8]) -> Option<&[u8]> {
+    let take_len = |b: &[u8]| -> Option<usize> {
+        usize::try_from(u64::from_be_bytes(b.get(..8)?.try_into().ok()?)).ok()
+    };
+    let meta_len = take_len(state)?;
+    let rest = state.get(8..)?.get(meta_len..)?;
+    let web_len = take_len(rest)?;
+    let web = rest.get(8..)?;
+    (web.len() == web_len).then_some(web)
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 async fn webapp_put(
@@ -2171,6 +2245,68 @@ mod tests {
     }
     const ID_A: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
     const ID_B: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";
+
+    fn web_state(meta: &[u8], web: &[u8]) -> Vec<u8> {
+        let mut s = (meta.len() as u64).to_be_bytes().to_vec();
+        s.extend_from_slice(meta);
+        s.extend_from_slice(&(web.len() as u64).to_be_bytes());
+        s.extend_from_slice(web);
+        s
+    }
+
+    /// Params are reported as the owner only when they, with the code, hash to
+    /// the id asked for.
+    #[test]
+    fn contract_params_are_only_reported_when_they_hash_to_the_id() {
+        use freenet_stdlib::prelude::{ContractWasmAPIVersion, WrappedContract};
+        let code = b"\0asm some contract code".to_vec();
+        let container = |params: &[u8]| {
+            ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(code.clone())),
+                Parameters::from(params.to_vec()),
+            )))
+        };
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let id_a = *NodeClient::contract_key(&code, &a).id();
+        let (hash, params) = verified_params(&container(&a), &id_a).expect("matches");
+        assert_eq!(params, a.to_vec());
+        assert_eq!(
+            hash,
+            NodeClient::contract_key(&code, &a).code_hash().to_string()
+        );
+        assert_eq!(verified_params(&container(&b), &id_a), None);
+    }
+
+    /// The archive hash is the "same bytes as another site" signal, so the parse
+    /// must skip the signed metadata (which always differs between owners) and
+    /// must refuse anything that is not exactly the web-container layout.
+    #[test]
+    fn web_container_archive_is_the_web_part_and_only_an_exact_layout() {
+        let web = b"archive bytes";
+        assert_eq!(
+            web_container_archive(&web_state(b"owner one's signature", web)),
+            Some(&web[..])
+        );
+        assert_eq!(
+            web_container_archive(&web_state(b"owner two", web)),
+            web_container_archive(&web_state(b"a different, longer signature", web)),
+        );
+        let mut trailing = web_state(b"m", web);
+        trailing.push(0);
+        assert_eq!(web_container_archive(&trailing), None, "trailing bytes");
+        let short = web_state(b"m", web);
+        assert_eq!(
+            web_container_archive(&short[..short.len() - 1]),
+            None,
+            "truncated"
+        );
+        assert_eq!(web_container_archive(&[]), None);
+        assert_eq!(
+            web_container_archive(&u64::MAX.to_be_bytes()),
+            None,
+            "huge length"
+        );
+    }
 
     /// Editing one app must never drop another. This is the entire reason
     /// `app-set` reads before writing, and it was previously untested.
